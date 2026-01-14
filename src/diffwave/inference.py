@@ -16,7 +16,7 @@
 import numpy as np
 import os
 import torch
-import torchaudio
+import soundfile as sf
 
 from argparse import ArgumentParser
 
@@ -95,7 +95,7 @@ def main(args):
   else:
     spectrogram = None
   audio, sr = predict(spectrogram, model_dir=args.model_dir, fast_sampling=args.fast, params=base_params)
-  torchaudio.save(args.output, audio.cpu(), sample_rate=sr)
+  sf.write(args.output, audio.cpu().numpy().squeeze(), sr)
 
 
 if __name__ == '__main__':

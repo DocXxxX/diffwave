@@ -18,7 +18,7 @@ import os
 import random
 import torch
 import torch.nn.functional as F
-import torchaudio
+import soundfile as sf
 
 from glob import glob
 from torch.utils.data.distributed import DistributedSampler
@@ -37,10 +37,10 @@ class ConditionalDataset(torch.utils.data.Dataset):
   def __getitem__(self, idx):
     audio_filename = self.filenames[idx]
     spec_filename = f'{audio_filename}.spec.npy'
-    signal, _ = torchaudio.load(audio_filename)
+    signal, _ = sf.read(audio_filename, dtype='float32')
     spectrogram = np.load(spec_filename)
     return {
-        'audio': signal[0],
+        'audio': torch.from_numpy(signal),
         'spectrogram': spectrogram.T
     }
 
@@ -58,9 +58,9 @@ class UnconditionalDataset(torch.utils.data.Dataset):
   def __getitem__(self, idx):
     audio_filename = self.filenames[idx]
     spec_filename = f'{audio_filename}.spec.npy'
-    signal, _ = torchaudio.load(audio_filename)
+    signal, _ = sf.read(audio_filename, dtype='float32')
     return {
-        'audio': signal[0],
+        'audio': torch.from_numpy(signal),
         'spectrogram': None
     }
 

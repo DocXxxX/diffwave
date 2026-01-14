@@ -15,7 +15,7 @@
 
 import numpy as np
 import torch
-import torchaudio as T
+import soundfile as sf
 import torchaudio.transforms as TT
 
 from argparse import ArgumentParser
@@ -27,8 +27,9 @@ from diffwave.params import params
 
 
 def transform(filename):
-  audio, sr = T.load(filename)
-  audio = torch.clamp(audio[0], -1.0, 1.0)
+  audio, sr = sf.read(filename, dtype='float32')
+  audio = torch.from_numpy(audio)
+  audio = torch.clamp(audio, -1.0, 1.0)
 
   if params.sample_rate != sr:
     raise ValueError(f'Invalid sample rate {sr}.')
