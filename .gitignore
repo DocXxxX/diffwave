@@ -1,10 +1,10 @@
-# Dataset directory
+﻿# Dataset directory
 LJSpeech-1.1/
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 *.so
 .Python
 build/
@@ -56,3 +56,5 @@ AudioTest/
 
 # Data
 Data_processed/
+监测参数表.csv
+Mamba-DiffWave.md
