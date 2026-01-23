@@ -53,3 +53,6 @@ AudioTest/
 
 # Agent
 .agent/
+
+# Data
+Data_processed/
