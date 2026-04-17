@@ -13,204 +13,326 @@
 # limitations under the License.
 # ==============================================================================
 
+import json
 import numpy as np
 import os
 import random
 import torch
 import torch.nn.functional as F
-import soundfile as sf
 import re
 import pandas as pd
-from scipy import signal
 from glob import glob
 from torch.utils.data.distributed import DistributedSampler
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
-from diffwave.preprocess_params import preprocess_params
+try:
+  import soundfile as sf
+except ImportError:
+  sf = None
+
+try:
+  import torchaudio
+except Exception:
+  torchaudio = None
+
+from diffwave.preprocess_params import (
+    BLAST_PARAM_COLUMNS,
+    load_and_clean_params,
+    validate_params,
+)
+
+
+BLAST_CHANNEL_COLUMNS = ['CH1', 'CH2', 'OT']
+BLAST_MATCH_REPORT = 'blast_match_report.csv'
+BLAST_STATS_FILE = 'blast_stats.json'
+
+
+def _parse_sz_filename(filepath: str) -> Optional[Dict]:
+  basename = os.path.basename(filepath)
+  match = re.match(r'^SZ_(\d{8})_(\d{6})_([A-Z]+)_(\d+)\.csv$', basename)
+  if not match:
+    return None
+  return {
+      'date_key': match.group(1),
+      'time_key': match.group(2),
+      'instrument': match.group(3),
+      'monitor_id': int(match.group(4)),
+  }
+
+
+def _param_groups(params_df: pd.DataFrame) -> Dict[Tuple[str, int], pd.DataFrame]:
+  groups = {}
+  for key, group in params_df.groupby(['DateKey', 'Monitor_ID'], dropna=False):
+    groups[(str(key[0]), int(key[1]))] = group
+  return groups
+
+
+def _param_vector(row: pd.Series) -> Optional[np.ndarray]:
+  if any(pd.isna(row.get(col, np.nan)) for col in BLAST_PARAM_COLUMNS):
+    return None
+  return row[BLAST_PARAM_COLUMNS].to_numpy(dtype=np.float32)
+
+
+def build_blast_records(data_dirs: List[str], params_csv_path: str, report_path: Optional[str] = None) -> List[Dict]:
+  params_df = load_and_clean_params(params_csv_path)
+  validate_params(params_df)
+  groups = _param_groups(params_df)
+
+  filenames = []
+  for path in data_dirs:
+    filenames += glob(f'{path}/**/*.csv', recursive=True)
+
+  records = []
+  report_rows = []
+  for filename in sorted(filenames):
+    meta = _parse_sz_filename(filename)
+    row = {
+        'filename': filename,
+        'status': 'skipped',
+        'reason': '',
+        'date_key': '',
+        'monitor_id': '',
+        'event_id': '',
+    }
+
+    if meta is None:
+      row['reason'] = 'filename_parse_failed'
+      report_rows.append(row)
+      continue
+
+    key = (meta['date_key'], meta['monitor_id'])
+    row['date_key'] = meta['date_key']
+    row['monitor_id'] = meta['monitor_id']
+    matches = groups.get(key)
+    if matches is None:
+      row['reason'] = 'no_parameter_row'
+      report_rows.append(row)
+      continue
+    if len(matches) != 1:
+      row['reason'] = 'ambiguous_parameter_rows'
+      row['event_id'] = '|'.join(matches['Event_ID'].astype(str).tolist())
+      report_rows.append(row)
+      continue
+
+    param_row = matches.iloc[0]
+    params_vector = _param_vector(param_row)
+    row['event_id'] = param_row['Event_ID']
+    if params_vector is None:
+      row['reason'] = 'missing_parameter_value'
+      report_rows.append(row)
+      continue
+
+    row['status'] = 'matched'
+    row['reason'] = ''
+    report_rows.append(row)
+    records.append({
+        'path': filename,
+        'event_id': param_row['Event_ID'],
+        'date_key': meta['date_key'],
+        'time_key': meta['time_key'],
+        'instrument': meta['instrument'],
+        'monitor_id': meta['monitor_id'],
+        'physical_params': params_vector,
+    })
+
+  if report_path:
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    pd.DataFrame(report_rows).to_csv(report_path, index=False, encoding='utf-8-sig')
+
+  skipped = len(report_rows) - len(records)
+  print(f"[INFO] Matched blast samples: {len(records)}/{len(report_rows)}; skipped {skipped}.")
+  return records
+
+
+def _load_blast_waveform(filepath: str) -> np.ndarray:
+  df = pd.read_csv(filepath)
+  missing_cols = [col for col in BLAST_CHANNEL_COLUMNS if col not in df.columns]
+  if missing_cols:
+    raise ValueError(f'{filepath} missing columns: {missing_cols}')
+
+  audio = df[BLAST_CHANNEL_COLUMNS].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+  audio = audio.to_numpy(dtype=np.float32).T
+  return np.nan_to_num(audio, copy=True)
+
+
+def _crop_or_pad_peak(audio: np.ndarray, target_len: int) -> np.ndarray:
+  length = audio.shape[1]
+  if length == target_len:
+    return audio
+  if length < target_len:
+    pad_width = target_len - length
+    return np.pad(audio, ((0, 0), (0, pad_width)), mode='constant')
+
+  peak_index = int(np.argmax(np.max(np.abs(audio), axis=0)))
+  start = peak_index - target_len // 2
+  start = min(max(start, 0), length - target_len)
+  return audio[:, start:start + target_len]
+
+
+def _compute_blast_stats(records: List[Dict], params) -> Dict:
+  if not records:
+    raise ValueError('No matched blast records are available for training.')
+
+  channel_sum = np.zeros(len(BLAST_CHANNEL_COLUMNS), dtype=np.float64)
+  channel_sumsq = np.zeros(len(BLAST_CHANNEL_COLUMNS), dtype=np.float64)
+  channel_count = 0
+
+  for record in records:
+    audio = _crop_or_pad_peak(_load_blast_waveform(record['path']), params.audio_len)
+    channel_sum += audio.sum(axis=1)
+    channel_sumsq += np.square(audio.astype(np.float64)).sum(axis=1)
+    channel_count += audio.shape[1]
+
+  channel_mean = channel_sum / channel_count
+  channel_var = channel_sumsq / channel_count - channel_mean ** 2
+  channel_std = np.sqrt(np.maximum(channel_var, 1e-12))
+
+  param_values = np.stack([record['physical_params'] for record in records])
+  param_mean = param_values.mean(axis=0)
+  param_std = param_values.std(axis=0)
+  param_std = np.maximum(param_std, 1e-6)
+
+  return {
+      'channel_columns': BLAST_CHANNEL_COLUMNS,
+      'param_columns': BLAST_PARAM_COLUMNS,
+      'channel_mean': channel_mean.astype(float).tolist(),
+      'channel_std': channel_std.astype(float).tolist(),
+      'param_mean': param_mean.astype(float).tolist(),
+      'param_std': param_std.astype(float).tolist(),
+      'sample_rate': int(params.sample_rate),
+      'audio_len': int(params.audio_len),
+  }
+
+
+def save_blast_stats(stats: Dict, stats_path: str) -> None:
+  os.makedirs(os.path.dirname(stats_path), exist_ok=True)
+  with open(stats_path, 'w', encoding='utf-8') as f:
+    json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def load_blast_stats(stats_path: str) -> Dict:
+  with open(stats_path, 'r', encoding='utf-8') as f:
+    return json.load(f)
 
 
 class BlastVibrationDataset(torch.utils.data.Dataset):
-    """爆破振动条件数据集"""
-    
-    def __init__(self, 
-                 data_dirs: list, 
-                 params_csv_path: str,
-                 sample_rate: int = 8000):
-        """
-        初始化数据集
-        
-        Args:
-            data_dirs: 波形文件所在目录列表
-            params_csv_path: 监测参数表CSV路径
-            sample_rate: 采样率
-        """
-        super().__init__()
-        self.sample_rate = sample_rate
-        
-        # 加载清洗后的参数字典
-        self.params_dict = preprocess_params(params_csv_path)
-        
-        # 遍历数据文件夹，获取所有波形文件
-        self.filenames = []
-        for path in data_dirs:
-            # 查找所有CSV文件
-            self.filenames += glob(f'{path}/**/*.csv', recursive=True)
-        
-        # 过滤掉参数表中不存在的文件
-        self.valid_files = []
-        for f in self.filenames:
-            key = self._parse_filename(f)
-            if key and key in self.params_dict:
-                self.valid_files.append(f)
-            else:
-                # 仅在调试时打印，避免刷屏
-                pass 
-                # print(f"[警告] 跳过文件 {f}：参数表中未找到对应记录")
-        
-        print(f"[信息] 有效样本数：{len(self.valid_files)}/{len(self.filenames)}")
-    
-    def _parse_filename(self, filepath: str) -> Optional[Tuple[str, int]]:
-        """
-        从文件名解析Event_ID和Monitor_ID
-        
-        Args:
-            filepath: 文件路径，如 BL20251106A_ID6.csv
-            
-        Returns:
-            (event_id, monitor_id) 元组或None
-        """
-        basename = os.path.basename(filepath)
-        # 匹配模式：BL20251106A_ID6.csv
-        match = re.match(r'(.+)_ID(\d+)\.csv', basename)
-        if match:
-            event_id = match.group(1)
-            monitor_id = int(match.group(2))
-            return (event_id, monitor_id)
-        return None
-    
-    def _load_waveform(self, filepath: str) -> np.ndarray:
-        """
-        加载并预处理波形数据
-        
-        Args:
-            filepath: CSV文件路径
-            
-        Returns:
-            预处理后的波形数组
-        """
-        try:
-            df = pd.read_csv(filepath)
-            
-            # 提取Z列（垂向分量）或计算矢量和
-            if 'Z' in df.columns:
-                waveform = df['Z'].values.astype(np.float32)
-            elif all(col in df.columns for col in ['X', 'Y', 'Z']):
-                # 计算三向矢量和
-                waveform = np.sqrt(
-                    df['X'].values**2 + df['Y'].values**2 + df['Z'].values**2
-                ).astype(np.float32)
-            else:
-                # 使用第一列作为波形数据
-                waveform = df.iloc[:, 0].values.astype(np.float32)
-            
-            # 去趋势
-            waveform = signal.detrend(waveform)
-            
-            # Z-Score归一化
-            mean = np.mean(waveform)
-            std = np.std(waveform)
-            if std > 1e-8:
-                waveform = (waveform - mean) / std
-                
-            return waveform
-        except Exception as e:
-            print(f"Error loading {filepath}: {e}")
-            return np.zeros(self.sample_rate, dtype=np.float32) # Return silent audio on error
-    
-    def __len__(self):
-        return len(self.valid_files)
-    
-    def __getitem__(self, idx):
-        filepath = self.valid_files[idx]
-        
-        # 解析文件名获取Key
-        key = self._parse_filename(filepath)
-        
-        # 获取物理参数
-        physical_params = self.params_dict[key]
-        
-        # 加载波形数据
-        waveform = self._load_waveform(filepath)
-        
-        return {
-            'audio': torch.from_numpy(waveform),
-            'physical_params': torch.from_numpy(physical_params),
-            'spectrogram': torch.zeros(1) # 不使用频谱图条件，提供占位符
-        }
+  """爆破振动条件数据集"""
+
+  def __init__(self, records: List[Dict], params, stats: Dict):
+    super().__init__()
+    self.records = records
+    self.params = params
+    self.stats = stats
+    self.channel_mean = np.asarray(stats['channel_mean'], dtype=np.float32)[:, None]
+    self.channel_std = np.asarray(stats['channel_std'], dtype=np.float32)[:, None]
+    self.param_mean = np.asarray(stats['param_mean'], dtype=np.float32)
+    self.param_std = np.asarray(stats['param_std'], dtype=np.float32)
+
+  def __len__(self):
+    return len(self.records)
+
+  def __getitem__(self, idx):
+    record = self.records[idx]
+    audio = _crop_or_pad_peak(_load_blast_waveform(record['path']), self.params.audio_len)
+    audio = (audio - self.channel_mean) / self.channel_std
+    audio_clip = getattr(self.params, 'audio_clip', None)
+    if audio_clip is not None and audio_clip > 0:
+      audio = np.clip(audio, -audio_clip, audio_clip)
+    physical_params = (record['physical_params'] - self.param_mean) / self.param_std
+
+    return {
+        'audio': torch.from_numpy(audio.astype(np.float32)),
+        'physical_params': torch.from_numpy(physical_params.astype(np.float32)),
+        'spectrogram': None,
+        'path': record['path'],
+    }
 
 
 class BlastCollator:
-    """爆破振动数据批处理器"""
-    
-    def __init__(self, params):
-        self.params = params
-    
-    def collate(self, minibatch):
-        target_len = self.params.audio_len
-        
-        valid_records = []
-        for record in minibatch:
-            audio = record['audio']
-            
-            # 处理长度
-            if len(audio) < target_len:
-                # 填充
-                audio = F.pad(audio, (0, target_len - len(audio)), mode='constant', value=0)
-            elif len(audio) > target_len:
-                # 随机裁剪
-                start = random.randint(0, len(audio) - target_len)
-                audio = audio[start:start + target_len]
-            
-            record['audio'] = audio
-            valid_records.append(record)
-        
-        if not valid_records:
-            # Should not happen in normal training loop if dataset is clean
-            # Return empty structure or handle appropriately
-            return {} 
-        
-        audio = torch.stack([r['audio'] for r in valid_records])
-        physical_params = torch.stack([r['physical_params'] for r in valid_records])
-        
-        return {
-            'audio': audio,
-            'physical_params': physical_params,
-            'spectrogram': None
-        }
+  """爆破振动数据批处理器"""
+
+  def __init__(self, params):
+    self.params = params
+
+  def collate(self, minibatch):
+    audio = torch.stack([record['audio'] for record in minibatch])
+    physical_params = torch.stack([record['physical_params'] for record in minibatch])
+
+    return {
+        'audio': audio,
+        'physical_params': physical_params,
+        'spectrogram': None,
+        'path': [record['path'] for record in minibatch],
+    }
+
+
+def _split_records(records: List[Dict], val_ratio: float, seed: int) -> Tuple[List[Dict], List[Dict]]:
+  records = list(records)
+  random.Random(seed).shuffle(records)
+  if val_ratio <= 0 or len(records) < 2:
+    return records, []
+  val_count = max(1, int(round(len(records) * val_ratio)))
+  val_count = min(val_count, len(records) - 1)
+  return records[val_count:], records[:val_count]
 
 
 def from_blast_data(data_dirs, params_csv_path, params, is_distributed=False):
-    """
-    创建爆破振动数据加载器
-    
-    Args:
-        data_dirs: 数据目录列表
-        params_csv_path: 参数表路径
-        params: 模型参数
-        is_distributed: 是否分布式训练
-    """
-    dataset = BlastVibrationDataset(data_dirs, params_csv_path, params.sample_rate)
-    
-    return torch.utils.data.DataLoader(
-        dataset,
+  """
+  创建爆破振动数据加载器
+
+  Args:
+      data_dirs: 数据目录列表
+      params_csv_path: 参数表路径
+      params: 模型参数
+      is_distributed: 是否分布式训练
+  """
+  train_loader, _ = create_blast_dataloaders(
+      data_dirs,
+      params_csv_path,
+      params,
+      is_distributed=is_distributed)
+  return train_loader
+
+
+def create_blast_dataloaders(data_dirs, params_csv_path, params, model_dir=None, is_distributed=False):
+  report_path = os.path.join(model_dir, BLAST_MATCH_REPORT) if model_dir else None
+  stats_path = os.path.join(model_dir, BLAST_STATS_FILE) if model_dir else None
+  records = build_blast_records(data_dirs, params_csv_path, report_path=report_path)
+  train_records, val_records = _split_records(
+      records,
+      getattr(params, 'val_ratio', 0.15),
+      getattr(params, 'split_seed', 2021))
+  stats = _compute_blast_stats(train_records, params)
+  if stats_path:
+    save_blast_stats(stats, stats_path)
+
+  train_dataset = BlastVibrationDataset(train_records, params, stats)
+  val_dataset = BlastVibrationDataset(val_records, params, stats) if val_records else None
+  train_sampler = DistributedSampler(train_dataset) if is_distributed else None
+  num_workers = min(os.cpu_count() or 1, getattr(params, 'num_workers', 4))
+
+  train_loader = torch.utils.data.DataLoader(
+      train_dataset,
+      batch_size=params.batch_size,
+      collate_fn=BlastCollator(params).collate,
+      shuffle=(train_sampler is None),
+      num_workers=num_workers,
+      sampler=train_sampler,
+      pin_memory=torch.cuda.is_available(),
+      drop_last=True)
+
+  val_loader = None
+  if val_dataset is not None:
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
         batch_size=params.batch_size,
         collate_fn=BlastCollator(params).collate,
-        shuffle=not is_distributed,
-        num_workers=min(os.cpu_count(), 4),
-        sampler=DistributedSampler(dataset) if is_distributed else None,
-        pin_memory=True,
-        drop_last=True
-    )
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False)
+
+  return train_loader, val_loader
 
 
 class ConditionalDataset(torch.utils.data.Dataset):
@@ -224,6 +346,8 @@ class ConditionalDataset(torch.utils.data.Dataset):
     return len(self.filenames)
 
   def __getitem__(self, idx):
+    if sf is None:
+      raise ImportError('soundfile is required to load wav datasets.')
     audio_filename = self.filenames[idx]
     spec_filename = f'{audio_filename}.spec.npy'
     signal, _ = sf.read(audio_filename, dtype='float32')
@@ -245,6 +369,8 @@ class UnconditionalDataset(torch.utils.data.Dataset):
     return len(self.filenames)
 
   def __getitem__(self, idx):
+    if sf is None:
+      raise ImportError('soundfile is required to load wav datasets.')
     audio_filename = self.filenames[idx]
     spec_filename = f'{audio_filename}.spec.npy'
     signal, _ = sf.read(audio_filename, dtype='float32')
@@ -343,6 +469,8 @@ def from_path(data_dirs, params, is_distributed=False):
 
 
 def from_gtzan(params, is_distributed=False):
+  if torchaudio is None:
+    raise ImportError('torchaudio is required to load GTZAN.')
   dataset = torchaudio.datasets.GTZAN('./data', download=True)
   return torch.utils.data.DataLoader(
       dataset,

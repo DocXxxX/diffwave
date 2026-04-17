@@ -53,8 +53,12 @@ setup(name = 'diffwave',
     package_dir = { '': 'src' },
     install_requires = [
         'numpy',
+        'pandas',
+        'scipy',
+        'soundfile',
         'torch>=1.6',
         'torchaudio>=0.9.0',
-        'tqdm'
+        'tqdm',
+        'wandb'
     ],
     classifiers = CLASSIFIERS)

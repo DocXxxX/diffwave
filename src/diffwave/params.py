@@ -37,17 +37,33 @@ params = AttrDict(
     batch_size=64,
     learning_rate=2e-4,
     max_grad_norm=None,
+    loss_type='l1',
+    validation_interval=500,
+    validation_batches=8,
+    checkpoint_interval=None,
+    num_workers=4,
+    split_seed=2021,
+    val_ratio=0.15,
+    use_wandb=False,
+    wandb_project='blast-diffwave',
+    wandb_run_name=None,
 
     # Data params
     sample_rate=8000,      # 爆破振动数据采样率 (原22050)
+    audio_channels=3,
+    audio_clip=None,
     n_mels=80,
     n_fft=1024,
     hop_samples=256,
     crop_mel_frames=62,  # Probably an error in paper.
+    data_format='blast_csv',
+    default_blast_data_dir='dataset/SZ_blast',
+    default_blast_params_csv='Final_20260411 Parameter Table.csv',
     
     # 【新增】物理条件参数
-    condition_dim=5,       # 物理参数维度：Q_max, Distance_R, Elev_Diff, Hole_Num, Delay_Int
+    condition_dim=8,       # Q_max, Q_total, Hole_Num, Delay_hole, Delay_row, Hole_Diameter, Distance_R, Elev_Diff
     use_physics_condition=True,  # 使用物理参数条件
+    use_physics_loss=False,
 
     # Model params
     residual_layers=30,
@@ -68,5 +84,6 @@ params = AttrDict(
     diffusion_step_embed_dim_in=512,  # 扩散步嵌入维度
 
     # unconditional sample len
-    audio_len = 8000*5, # unconditional_synthesis_samples
+    audio_len=20000,
+    sample_clamp=False,
 )

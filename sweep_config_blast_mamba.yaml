@@ -1,0 +1,144 @@
+# sweep_config_blast_mamba.yaml
+# W&B Sweep configuration for blast Mamba-DiffWave.
+# Usage:
+#   1. wandb sweep sweep_config_blast_mamba.yaml
+#   2. wandb agent <entity/project/sweep-id> --count <N>
+
+project: blast-diffwave
+name: Blast_Mamba_DiffWave_bayes
+
+program: run_blast_sweep.py
+command:
+  - ${env}
+  - ${interpreter}
+  - ${program}
+
+method: random
+
+
+metric:
+  name: val/loss
+  goal: minimize
+
+parameters:
+
+  ################################################
+  # A. Optimization
+  ################################################
+
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.0002
+
+  batch_size:
+    values: [4, 8]
+
+  loss_type:
+    value: 'l1'
+
+  max_grad_norm:
+    value: 1.0
+
+  ################################################
+  # B. DiffWave Architecture
+  ################################################
+
+  residual_channels:
+    values: [32, 64]
+
+  residual_layers:
+    values: [12, 20]
+
+  mamba_d_state:
+    value: 8
+
+  mamba_expand:
+    values: [1, 2]
+
+  film_hidden_dim:
+    values: [128, 256]
+
+  ################################################
+  # C. Fixed Training Parameters
+  ################################################
+
+  model_dir:
+    value: 'sweep_runs/blast_mamba'
+
+  data_dirs:
+    value: ['dataset/SZ_blast']
+
+  params_csv:
+    value: 'Final_20260411 Parameter Table.csv'
+
+  data_format:
+    value: 'blast_csv'
+
+  max_steps:
+    value: 20000
+
+  device:
+    value: 'cuda'
+
+  fp16:
+    value: false
+
+  num_workers:
+    value: 4
+
+  validation_interval:
+    value: 500
+
+  validation_batches:
+    value: 8
+
+  checkpoint_interval:
+    value: 1000
+
+  split_seed:
+    value: 2021
+
+  val_ratio:
+    value: 0.15
+
+  ################################################
+  # D. Fixed Data and Model Shape
+  ################################################
+
+  use_mamba:
+    value: true
+
+  audio_len:
+    value: 20000
+
+  audio_channels:
+    value: 3
+
+  audio_clip:
+    value: 8.0
+
+  condition_dim:
+    value: 8
+
+  sample_clamp:
+    value: false
+
+  ################################################
+  # E. Post-Training Sample Generation
+  ################################################
+
+  generate_samples:
+    value: true
+
+  sample_fast:
+    value: false
+
+  sample_dir:
+    value: 'samples'
+
+  sample_blast_params:
+    value:
+      - [2.2, 151.8, 76.0, 28.6, 74.8, 57.5, 13.8, 6.5]
+      - [1.6, 110.0, 55.0, 25.0, 65.0, 42.0, 10.0, 4.0]
+      - [2.8, 210.0, 105.0, 32.0, 90.0, 76.0, 22.0, 10.0]

@@ -13,18 +13,22 @@
 # limitations under the License.
 # ==============================================================================
 
-import numpy as np
 import os
+
+import numpy as np
 import torch
 import torch.nn as nn
 
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from diffwave.dataset import from_path, from_gtzan, from_blast_data
+try:
+  from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+  SummaryWriter = None
+
+from diffwave.dataset import create_blast_dataloaders, from_gtzan, from_path
 from diffwave.model import DiffWave
-from diffwave.params import AttrDict
 from diffwave.physics_ops import PhysicsLoss
 
 
@@ -38,30 +42,43 @@ def _nested_map(struct, map_fn):
   return map_fn(struct)
 
 
+def _device_from_args(args, replica_id=None):
+  requested = getattr(args, 'device', 'cuda')
+  if requested.startswith('cuda') and not torch.cuda.is_available():
+    return torch.device('cpu')
+  if replica_id is not None and requested.startswith('cuda'):
+    return torch.device('cuda', replica_id)
+  return torch.device(requested)
+
+
+def _loss_fn(params):
+  if getattr(params, 'use_physics_loss', False):
+    return PhysicsLoss(sample_rate=params.sample_rate)
+  if getattr(params, 'loss_type', 'l1') == 'mse':
+    return nn.MSELoss()
+  return nn.L1Loss()
+
+
 class DiffWaveLearner:
-  def __init__(self, model_dir, model, dataset, optimizer, params, *args, **kwargs):
+  def __init__(self, model_dir, model, dataset, optimizer, params, val_dataset=None, wandb_run=None, *args, **kwargs):
     os.makedirs(model_dir, exist_ok=True)
     self.model_dir = model_dir
     self.model = model
     self.dataset = dataset
+    self.val_dataset = val_dataset
     self.optimizer = optimizer
     self.params = params
+    self.wandb_run = wandb_run
     self.autocast = torch.cuda.amp.autocast(enabled=kwargs.get('fp16', False))
     self.scaler = torch.cuda.amp.GradScaler(enabled=kwargs.get('fp16', False))
     self.step = 0
     self.is_master = True
+    self.grad_norm = torch.tensor(0.0)
 
     beta = np.array(self.params.noise_schedule)
     noise_level = np.cumprod(1 - beta)
     self.noise_level = torch.tensor(noise_level.astype(np.float32))
-    
-    # Use PhysicsLoss if configured (for blast vibration)
-    # Default to L1Loss if not specified or not applicable/configured
-    if getattr(params, 'use_physics_condition', False):
-         self.loss_fn = PhysicsLoss(sample_rate=params.sample_rate)
-    else:
-         self.loss_fn = nn.L1Loss()
-         
+    self.loss_fn = _loss_fn(params)
     self.summary_writer = None
 
   def state_dict(self):
@@ -72,7 +89,7 @@ class DiffWaveLearner:
     return {
         'step': self.step,
         'model': { k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in model_state.items() },
-        'optimizer': { k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in self.optimizer.state_dict().items() },
+        'optimizer': self.optimizer.state_dict(),
         'params': dict(self.params),
         'scaler': self.scaler.state_dict(),
     }
@@ -83,7 +100,7 @@ class DiffWaveLearner:
     else:
       self.model.load_state_dict(state_dict['model'])
     self.optimizer.load_state_dict(state_dict['optimizer'])
-    self.scaler.load_state_dict(state_dict['scaler'])
+    self.scaler.load_state_dict(state_dict.get('scaler', {}))
     self.step = state_dict['step']
 
   def save_to_checkpoint(self, filename='weights'):
@@ -100,171 +117,186 @@ class DiffWaveLearner:
 
   def restore_from_checkpoint(self, filename='weights'):
     try:
-      checkpoint = torch.load(f'{self.model_dir}/{filename}.pt')
+      checkpoint = torch.load(f'{self.model_dir}/{filename}.pt', map_location=next(self.model.parameters()).device)
       self.load_state_dict(checkpoint)
       return True
     except FileNotFoundError:
       return False
 
   def train(self, max_steps=None):
-    device = next(self.model.parameters()).device
+    if len(self.dataset) == 0:
+      raise ValueError('Training dataset is empty.')
+
+    checkpoint_interval = self.params.checkpoint_interval or len(self.dataset)
+    validation_interval = getattr(self.params, 'validation_interval', 0)
+    self.model.train()
+
     while True:
-      for features in tqdm(self.dataset, desc=f'Epoch {self.step // len(self.dataset)}') if self.is_master else self.dataset:
+      epoch = self.step // len(self.dataset)
+      iterator = tqdm(self.dataset, desc=f'Epoch {epoch}') if self.is_master else self.dataset
+      for features in iterator:
         if max_steps is not None and self.step >= max_steps:
+          if self.is_master:
+            self.save_to_checkpoint()
           return
-        features = _nested_map(features, lambda x: x.to(device) if isinstance(x, torch.Tensor) else x)
+        features = self._to_device(features)
         loss = self.train_step(features)
         if torch.isnan(loss).any():
           raise RuntimeError(f'Detected NaN loss at step {self.step}.')
         if self.is_master:
           if self.step % 50 == 0:
             self._write_summary(self.step, features, loss)
-          if self.step % len(self.dataset) == 0:
+          if self.val_dataset is not None and validation_interval and self.step % validation_interval == 0:
+            self.validate()
+          if self.step % checkpoint_interval == 0:
             self.save_to_checkpoint()
         self.step += 1
+
+  def _to_device(self, features):
+    device = next(self.model.parameters()).device
+    return _nested_map(features, lambda x: x.to(device) if isinstance(x, torch.Tensor) else x)
+
+  def _diffusion_loss(self, features):
+    audio = features['audio']
+    spectrogram = features.get('spectrogram')
+    physical_params = features.get('physical_params')
+
+    batch_size = audio.shape[0]
+    device = audio.device
+    self.noise_level = self.noise_level.to(device)
+
+    t = torch.randint(0, len(self.params.noise_schedule), [batch_size], device=audio.device)
+    view_shape = [batch_size] + [1] * (audio.dim() - 1)
+    noise_scale = self.noise_level[t].view(*view_shape)
+    noise_scale_sqrt = noise_scale**0.5
+    noise = torch.randn_like(audio)
+    noisy_audio = noise_scale_sqrt * audio + (1.0 - noise_scale)**0.5 * noise
+    predicted = self.model(noisy_audio, t, spectrogram, physical_params)
+
+    if isinstance(self.loss_fn, PhysicsLoss):
+      loss, _ = self.loss_fn(predicted[:, 0], noise[:, 0], physical_params)
+      return loss
+    return self.loss_fn(noise, predicted)
 
   def train_step(self, features):
     for param in self.model.parameters():
       param.grad = None
 
-    audio = features['audio']
-    spectrogram = features.get('spectrogram')
-    physical_params = features.get('physical_params')
-
-    N, T = audio.shape
-    device = audio.device
-    self.noise_level = self.noise_level.to(device)
-
     with self.autocast:
-      t = torch.randint(0, len(self.params.noise_schedule), [N], device=audio.device)
-      noise_scale = self.noise_level[t].unsqueeze(1)
-      noise_scale_sqrt = noise_scale**0.5
-      noise = torch.randn_like(audio)
-      noisy_audio = noise_scale_sqrt * audio + (1.0 - noise_scale)**0.5 * noise
-
-      predicted = self.model(noisy_audio, t, spectrogram, physical_params)
-      
-      if isinstance(self.loss_fn, PhysicsLoss):
-           loss, sub_losses = self.loss_fn(predicted.squeeze(1), noise, physical_params)
-           # Store sub_losses for summary if needed?
-           # For now just use total loss
-      else:
-           loss = self.loss_fn(noise, predicted.squeeze(1))
+      loss = self._diffusion_loss(features)
 
     self.scaler.scale(loss).backward()
     self.scaler.unscale_(self.optimizer)
     self.grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.params.max_grad_norm or 1e9)
     self.scaler.step(self.optimizer)
     self.scaler.update()
-    return loss
+    return loss.detach()
+
+  def validate(self):
+    self.model.eval()
+    total_loss = 0.0
+    count = 0
+    max_batches = getattr(self.params, 'validation_batches', 8)
+    with torch.no_grad():
+      for features in self.val_dataset:
+        if max_batches and count >= max_batches:
+          break
+        loss = self._diffusion_loss(self._to_device(features))
+        total_loss += float(loss.detach().cpu())
+        count += 1
+    self.model.train()
+    if count == 0:
+      return None
+    val_loss = total_loss / count
+    if self.summary_writer:
+      self.summary_writer.add_scalar('val/loss', val_loss, self.step)
+    if self.wandb_run:
+      self.wandb_run.log({'val/loss': val_loss, 'step': self.step}, step=self.step)
+    return val_loss
 
   def _write_summary(self, step, features, loss):
-    writer = self.summary_writer or SummaryWriter(self.model_dir, purge_step=step)
-    writer.add_audio('feature/audio', features['audio'][0], step, sample_rate=self.params.sample_rate)
-    
-    if not self.params.unconditional:
-        if features.get('spectrogram') is not None:
-             writer.add_image('feature/spectrogram', torch.flip(features['spectrogram'][:1], [1]), step)
-    
-    writer.add_scalar('train/loss', loss, step)
-    writer.add_scalar('train/grad_norm', self.grad_norm, step)
-    writer.flush()
-    self.summary_writer = writer
+    if SummaryWriter is not None:
+      writer = self.summary_writer or SummaryWriter(self.model_dir, purge_step=step)
+      preview = torch.clamp(features['audio'][0, 0].detach().cpu(), -1.0, 1.0)
+      writer.add_audio('feature/audio_ch1', preview, step, sample_rate=self.params.sample_rate)
+      writer.add_scalar('train/loss', loss, step)
+      writer.add_scalar('train/grad_norm', self.grad_norm, step)
+      writer.flush()
+      self.summary_writer = writer
+
+    if self.wandb_run:
+      self.wandb_run.log({
+          'train/loss': float(loss.detach().cpu()),
+          'train/grad_norm': float(self.grad_norm.detach().cpu()),
+          'step': step,
+      }, step=step)
 
 
-def _train_impl(replica_id, model, dataset, args, params):
+def _create_loaders(args, params, is_distributed=False):
+  data_format = getattr(args, 'data_format', getattr(params, 'data_format', 'path'))
+  if data_format == 'blast_csv':
+    if not getattr(args, 'params_csv', None):
+      raise ValueError('--params_csv is required for blast_csv training.')
+    return create_blast_dataloaders(
+        args.data_dirs,
+        args.params_csv,
+        params,
+        model_dir=args.model_dir,
+        is_distributed=is_distributed)
+  if args.data_dirs[0] == 'gtzan':
+    return from_gtzan(params, is_distributed=is_distributed), None
+  return from_path(args.data_dirs, params, is_distributed=is_distributed), None
+
+
+def _train_impl(replica_id, model, dataset, val_dataset, args, params, wandb_run=None):
   torch.backends.cudnn.benchmark = True
   opt = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
 
-  learner = DiffWaveLearner(args.model_dir, model, dataset, opt, params, fp16=args.fp16)
+  learner = DiffWaveLearner(
+      args.model_dir,
+      model,
+      dataset,
+      opt,
+      params,
+      val_dataset=val_dataset,
+      wandb_run=wandb_run,
+      fp16=args.fp16)
   learner.is_master = (replica_id == 0)
   learner.restore_from_checkpoint()
   learner.train(max_steps=args.max_steps)
 
 
-def train(args, params):
-  # Check if using blast data via arguments or presence of params file
-  # Note: Modified to prefer blast data loader if params.csv is present in args (needs args support)
-  # BUT: The original code passed args.data_dirs (list).
-  # If the user provides a params CSV, we should use from_blast_data.
-  # Let's check if the second arg is a csv or if a specific flag is set.
-  # Since we don't control args parsing here (it's in __main__.py), we make an assumption:
-  # If we see a file named '监测参数表.csv' in the parent dir of data_dirs[0] or passed explicitly?
-  # Simplified: We assume usage of from_blast_data if params.use_physics_condition is True
-  # and we need to find the params csv.
-  # For now, let's look for a known params file or assume custom argument handling in main.
-  
-  # For this specific task, let's hardcode/heuristically detect for the user:
-  # If data_dirs contains a csv file?
-  
-  # Assuming args has a 'params_csv' attribute if we modified the arg parser.
-  # But we haven't modified __main__.py yet.
-  # Let's assume standard usage for now unless specific Blast dataset is requested.
-  
-  # However, to support the user request "run modifications", I should ensure it works.
-  # I will assume that IF 'use_physics_condition' is True, we use from_blast_data.
-  # And we need the params file.
-  
-  # Let's check if a params file is provided in args (we might need to add it to main).
-  # Or we hardcode the path as per the requirement since this is a specific project.
-  # The requirement said "监测参数表.csv".
-  
-  if getattr(params, 'use_physics_condition', False):
-      # Try to find params csv
-      params_csv = '监测参数表.csv' # Default expected name
-      # Check if it exists relative to data_dirs[0] or current dir
-      if not os.path.exists(params_csv):
-           # check data_dirs[0] parent
-           potential = os.path.join(os.path.dirname(args.data_dirs[0]), params_csv)
-           if os.path.exists(potential):
-               params_csv = potential
-      
-      if os.path.exists(params_csv):
-           print(f"Using Blast Vibration Dataset with params: {params_csv}")
-           dataset = from_blast_data(args.data_dirs, params_csv, params)
-      else:
-           # Fallback or error?
-           print(f"Warning: use_physics_condition is True but {params_csv} not found. Using standard loader.")
-           if args.data_dirs[0] == 'gtzan':
-                dataset = from_gtzan(params)
-           else:
-                dataset = from_path(args.data_dirs, params)
-  elif args.data_dirs[0] == 'gtzan':
-    dataset = from_gtzan(params)
-  else:
-    dataset = from_path(args.data_dirs, params)
-    
-  model = DiffWave(params).cuda()
-  _train_impl(0, model, dataset, args, params)
+def train(args, params, wandb_run=None):
+  created_run = None
+  if getattr(params, 'use_wandb', False) and wandb_run is None:
+    try:
+      import wandb
+    except ImportError as exc:
+      raise ImportError('wandb is required when use_wandb=True') from exc
+    created_run = wandb.init(
+        project=params.wandb_project,
+        name=params.wandb_run_name,
+        config=dict(params))
+    wandb_run = created_run
+
+  try:
+    dataset, val_dataset = _create_loaders(args, params)
+    device = _device_from_args(args)
+    model = DiffWave(params).to(device)
+    _train_impl(0, model, dataset, val_dataset, args, params, wandb_run=wandb_run)
+  finally:
+    if created_run is not None:
+      created_run.finish()
 
 
 def train_distributed(replica_id, replica_count, port, args, params):
   os.environ['MASTER_ADDR'] = 'localhost'
   os.environ['MASTER_PORT'] = str(port)
   torch.distributed.init_process_group('nccl', rank=replica_id, world_size=replica_count)
-  
-  # Similar logic for dataset selection
-  if getattr(params, 'use_physics_condition', False):
-      params_csv = '监测参数表.csv'
-      if not os.path.exists(params_csv):
-           potential = os.path.join(os.path.dirname(args.data_dirs[0]), params_csv)
-           if os.path.exists(potential):
-               params_csv = potential
-      
-      if os.path.exists(params_csv):
-           dataset = from_blast_data(args.data_dirs, params_csv, params, is_distributed=True)
-      else:
-           if args.data_dirs[0] == 'gtzan':
-                dataset = from_gtzan(params, is_distributed=True)
-           else:
-                dataset = from_path(args.data_dirs, params, is_distributed=True)
-  elif args.data_dirs[0] == 'gtzan':
-    dataset = from_gtzan(params, is_distributed=True)
-  else:
-    dataset = from_path(args.data_dirs, params, is_distributed=True)
-    
-  device = torch.device('cuda', replica_id)
+
+  dataset, val_dataset = _create_loaders(args, params, is_distributed=True)
+  device = _device_from_args(args, replica_id)
   torch.cuda.set_device(device)
   model = DiffWave(params).to(device)
   model = DistributedDataParallel(model, device_ids=[replica_id])
-  _train_impl(replica_id, model, dataset, args, params)
+  _train_impl(replica_id, model, dataset, val_dataset, args, params)

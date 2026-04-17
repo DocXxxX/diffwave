@@ -1,0 +1,23 @@
+# Core numerical and data dependencies
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
+tqdm>=4.64
+
+# Audio IO and preprocessing
+soundfile>=0.12
+
+# PyTorch stack
+# For CUDA-enabled WSL installs, install torch/torchaudio with the matching
+# PyTorch CUDA index URL before or while installing this file.
+torch>=2.1
+torchaudio>=2.1
+
+# Experiment tracking and training logs
+wandb>=0.16
+tensorboard>=2.13
+
+# Mamba-DiffWave default model path.
+# If installation fails on CPU-only environments, run training with
+# `--use_mamba false` or install these after setting up a compatible CUDA toolchain.
+mamba-ssm[causal-conv1d]>=2.2.2

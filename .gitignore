@@ -50,11 +50,16 @@ Thumbs.db
 
 # Output directories
 AudioTest/
+sweep_runs/
+test_checkpoints/
+wandb/
 
 # Agent
 .agent/
 
 # Data
 Data_processed/
+dataset/
+Final_20260411 Parameter Table.csv
 监测参数表.csv
 Mamba-DiffWave.md
