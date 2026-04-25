@@ -16,6 +16,31 @@
 import numpy as np
 
 
+BLAST_AUGMENT_LEVELS = {
+    'off': {
+        'blast_augment': False,
+        'blast_peak_jitter': 0,
+        'blast_time_shift': 0,
+        'blast_gain_min': 1.0,
+        'blast_gain_max': 1.0,
+    },
+    'conservative': {
+        'blast_augment': True,
+        'blast_peak_jitter': 2000,
+        'blast_time_shift': 500,
+        'blast_gain_min': 0.95,
+        'blast_gain_max': 1.05,
+    },
+    'medium': {
+        'blast_augment': True,
+        'blast_peak_jitter': 4000,
+        'blast_time_shift': 1000,
+        'blast_gain_min': 0.90,
+        'blast_gain_max': 1.10,
+    },
+}
+
+
 class AttrDict(dict):
   def __init__(self, *args, **kwargs):
       super(AttrDict, self).__init__(*args, **kwargs)
@@ -32,9 +57,19 @@ class AttrDict(dict):
     return self
 
 
+def apply_blast_augment_level(target_params, level):
+  if level is None:
+    return target_params
+  if level not in BLAST_AUGMENT_LEVELS:
+    raise ValueError(f'Invalid blast_augment_level: {level}')
+  target_params.override(BLAST_AUGMENT_LEVELS[level])
+  target_params.blast_augment_level = level
+  return target_params
+
+
 params = AttrDict(
     # Training params
-    batch_size=64,
+    batch_size=8,
     learning_rate=2e-4,
     max_grad_norm=None,
     loss_type='l1',
@@ -59,6 +94,12 @@ params = AttrDict(
     data_format='blast_csv',
     default_blast_data_dir='dataset/SZ_blast',
     default_blast_params_csv='Final_20260411 Parameter Table.csv',
+    blast_augment=True,
+    blast_augment_level='conservative',
+    blast_peak_jitter=2000,
+    blast_time_shift=500,
+    blast_gain_min=0.95,
+    blast_gain_max=1.05,
     
     # 【新增】物理条件参数
     condition_dim=8,       # Q_max, Q_total, Hole_Num, Delay_hole, Delay_row, Hole_Diameter, Distance_R, Elev_Diff

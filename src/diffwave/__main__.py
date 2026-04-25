@@ -19,7 +19,7 @@ from torch.cuda import device_count
 from torch.multiprocessing import spawn
 
 from diffwave.learner import train, train_distributed
-from diffwave.params import params
+from diffwave.params import BLAST_AUGMENT_LEVELS, apply_blast_augment_level, params
 
 
 def _get_free_port():
@@ -71,12 +71,20 @@ def _apply_overrides(args):
       'split_seed',
       'val_ratio',
       'data_format',
+      'blast_augment',
+      'blast_augment_level',
+      'blast_peak_jitter',
+      'blast_time_shift',
+      'blast_gain_min',
+      'blast_gain_max',
       'use_wandb',
       'wandb_project',
       'wandb_run_name',
       'sample_clamp',
   ]
   overrides = { name: getattr(args, name) for name in override_names if getattr(args, name, None) is not None }
+  augment_level = overrides.pop('blast_augment_level', None)
+  apply_blast_augment_level(params, augment_level)
   params.override(overrides)
 
 
@@ -108,6 +116,12 @@ if __name__ == '__main__':
       help='blast parameter CSV path')
   parser.add_argument('--data_format', default='blast_csv', choices=['blast_csv', 'path'],
       help='training data format')
+  parser.add_argument('--blast_augment', type=_str_to_bool)
+  parser.add_argument('--blast_augment_level', choices=list(BLAST_AUGMENT_LEVELS.keys()))
+  parser.add_argument('--blast_peak_jitter', type=int)
+  parser.add_argument('--blast_time_shift', type=int)
+  parser.add_argument('--blast_gain_min', type=float)
+  parser.add_argument('--blast_gain_max', type=float)
   parser.add_argument('--max_steps', default=None, type=int,
       help='maximum number of training steps')
   parser.add_argument('--fp16', action='store_true', default=False,

@@ -32,7 +32,7 @@ parameters:
     max: 0.0002
 
   batch_size:
-    values: [4, 8]
+    value: 8
 
   loss_type:
     value: 'l1'
@@ -117,6 +117,9 @@ parameters:
 
   audio_clip:
     value: 8.0
+
+  blast_augment_level:
+    values: ['off', 'conservative', 'medium']
 
   condition_dim:
     value: 8

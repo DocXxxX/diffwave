@@ -13,7 +13,7 @@ import wandb
 import torch
 from diffwave.inference import predict, write_blast_csv
 from diffwave.learner import train
-from diffwave.params import AttrDict, params as base_params
+from diffwave.params import AttrDict, apply_blast_augment_level, params as base_params
 
 
 SAMPLE_PARAM_COLUMNS = [
@@ -55,6 +55,12 @@ PARAM_OVERRIDE_NAMES = [
   'num_workers',
   'split_seed',
   'val_ratio',
+  'blast_augment',
+  'blast_augment_level',
+  'blast_peak_jitter',
+  'blast_time_shift',
+  'blast_gain_min',
+  'blast_gain_max',
   'sample_clamp',
 ]
 
@@ -161,6 +167,8 @@ def _run_params(config):
       for name in PARAM_OVERRIDE_NAMES
       if name in config and config[name] is not None
   }
+  augment_level = overrides.pop('blast_augment_level', None)
+  apply_blast_augment_level(run_params, augment_level)
   run_params.override(overrides)
   run_params.use_wandb = False
   return run_params
@@ -173,6 +181,14 @@ def main():
     for name in SAFETY_DEFAULTS:
       if name not in config:
         run.config.update({name: run_params[name]}, allow_val_change=True)
+    run.config.update({
+        'blast_augment': run_params.blast_augment,
+        'blast_augment_level': run_params.blast_augment_level,
+        'blast_peak_jitter': run_params.blast_peak_jitter,
+        'blast_time_shift': run_params.blast_time_shift,
+        'blast_gain_min': run_params.blast_gain_min,
+        'blast_gain_max': run_params.blast_gain_max,
+    }, allow_val_change=True)
 
     model_root = _resolve_path(_config_value(config, 'model_dir', 'sweep_runs/blast_mamba'))
     data_dirs = _as_data_dirs(_config_value(config, 'data_dirs'))

@@ -73,6 +73,25 @@ def _param_vector(row: pd.Series) -> Optional[np.ndarray]:
   return row[BLAST_PARAM_COLUMNS].to_numpy(dtype=np.float32)
 
 
+def _resolve_ambiguous_param_row(matches: pd.DataFrame, meta: Dict) -> Optional[pd.Series]:
+  date_key = meta['date_key']
+  monitor_id = meta['monitor_id']
+
+  target_event_id = None
+  if date_key == '20251124' and monitor_id in {2, 3, 5, 6, 7}:
+    target_event_id = 'BL20251124A' if meta['time_key'] < '125000' else 'BL20251124B'
+  elif date_key == '20251201' and monitor_id in {1, 2}:
+    target_event_id = 'BL20251201A'
+
+  if target_event_id is None:
+    return None
+
+  resolved = matches[matches['Event_ID'] == target_event_id]
+  if len(resolved) != 1:
+    return None
+  return resolved.iloc[0]
+
+
 def build_blast_records(data_dirs: List[str], params_csv_path: str, report_path: Optional[str] = None) -> List[Dict]:
   params_df = load_and_clean_params(params_csv_path)
   validate_params(params_df)
@@ -109,12 +128,15 @@ def build_blast_records(data_dirs: List[str], params_csv_path: str, report_path:
       report_rows.append(row)
       continue
     if len(matches) != 1:
-      row['reason'] = 'ambiguous_parameter_rows'
-      row['event_id'] = '|'.join(matches['Event_ID'].astype(str).tolist())
-      report_rows.append(row)
-      continue
+      param_row = _resolve_ambiguous_param_row(matches, meta)
+      if param_row is None:
+        row['reason'] = 'ambiguous_parameter_rows'
+        row['event_id'] = '|'.join(matches['Event_ID'].astype(str).tolist())
+        report_rows.append(row)
+        continue
+    else:
+      param_row = matches.iloc[0]
 
-    param_row = matches.iloc[0]
     params_vector = _param_vector(param_row)
     row['event_id'] = param_row['Event_ID']
     if params_vector is None:
@@ -169,6 +191,60 @@ def _crop_or_pad_peak(audio: np.ndarray, target_len: int) -> np.ndarray:
   return audio[:, start:start + target_len]
 
 
+def _crop_or_pad_peak_random(audio: np.ndarray, target_len: int, peak_jitter: int) -> np.ndarray:
+  length = audio.shape[1]
+  if length == target_len:
+    return audio
+  if length < target_len:
+    pad_width = target_len - length
+    return np.pad(audio, ((0, 0), (0, pad_width)), mode='constant')
+
+  peak_index = int(np.argmax(np.max(np.abs(audio), axis=0)))
+  center_start = peak_index - target_len // 2
+  max_start = length - target_len
+  center_start = min(max(center_start, 0), max_start)
+  peak_jitter = max(0, int(peak_jitter))
+  start_min = max(0, center_start - peak_jitter)
+  start_max = min(max_start, center_start + peak_jitter)
+  start = random.randint(start_min, start_max) if start_max > start_min else center_start
+  return audio[:, start:start + target_len]
+
+
+def _time_shift_audio(audio: np.ndarray, max_shift: int) -> np.ndarray:
+  max_shift = max(0, int(max_shift))
+  if max_shift == 0:
+    return audio
+
+  shift = random.randint(-max_shift, max_shift)
+  if shift == 0:
+    return audio
+
+  shifted = np.zeros_like(audio)
+  if abs(shift) >= audio.shape[1]:
+    return shifted
+  if shift > 0:
+    shifted[:, shift:] = audio[:, :-shift]
+  else:
+    shifted[:, :shift] = audio[:, -shift:]
+  return shifted
+
+
+def _augment_blast_waveform(audio: np.ndarray, params) -> np.ndarray:
+  audio = _crop_or_pad_peak_random(
+      audio,
+      params.audio_len,
+      getattr(params, 'blast_peak_jitter', 0))
+  audio = _time_shift_audio(audio, getattr(params, 'blast_time_shift', 0))
+
+  gain_min = float(getattr(params, 'blast_gain_min', 1.0))
+  gain_max = float(getattr(params, 'blast_gain_max', 1.0))
+  if gain_min > gain_max:
+    raise ValueError(f'blast_gain_min ({gain_min}) cannot exceed blast_gain_max ({gain_max}).')
+  if gain_min != 1.0 or gain_max != 1.0:
+    audio = audio * random.uniform(gain_min, gain_max)
+  return audio
+
+
 def _compute_blast_stats(records: List[Dict], params) -> Dict:
   if not records:
     raise ValueError('No matched blast records are available for training.')
@@ -218,11 +294,12 @@ def load_blast_stats(stats_path: str) -> Dict:
 class BlastVibrationDataset(torch.utils.data.Dataset):
   """爆破振动条件数据集"""
 
-  def __init__(self, records: List[Dict], params, stats: Dict):
+  def __init__(self, records: List[Dict], params, stats: Dict, is_training: bool = False):
     super().__init__()
     self.records = records
     self.params = params
     self.stats = stats
+    self.is_training = is_training
     self.channel_mean = np.asarray(stats['channel_mean'], dtype=np.float32)[:, None]
     self.channel_std = np.asarray(stats['channel_std'], dtype=np.float32)[:, None]
     self.param_mean = np.asarray(stats['param_mean'], dtype=np.float32)
@@ -233,7 +310,11 @@ class BlastVibrationDataset(torch.utils.data.Dataset):
 
   def __getitem__(self, idx):
     record = self.records[idx]
-    audio = _crop_or_pad_peak(_load_blast_waveform(record['path']), self.params.audio_len)
+    raw_audio = _load_blast_waveform(record['path'])
+    if self.is_training and getattr(self.params, 'blast_augment', False):
+      audio = _augment_blast_waveform(raw_audio, self.params)
+    else:
+      audio = _crop_or_pad_peak(raw_audio, self.params.audio_len)
     audio = (audio - self.channel_mean) / self.channel_std
     audio_clip = getattr(self.params, 'audio_clip', None)
     if audio_clip is not None and audio_clip > 0:
@@ -306,8 +387,8 @@ def create_blast_dataloaders(data_dirs, params_csv_path, params, model_dir=None,
   if stats_path:
     save_blast_stats(stats, stats_path)
 
-  train_dataset = BlastVibrationDataset(train_records, params, stats)
-  val_dataset = BlastVibrationDataset(val_records, params, stats) if val_records else None
+  train_dataset = BlastVibrationDataset(train_records, params, stats, is_training=True)
+  val_dataset = BlastVibrationDataset(val_records, params, stats, is_training=False) if val_records else None
   train_sampler = DistributedSampler(train_dataset) if is_distributed else None
   num_workers = min(os.cpu_count() or 1, getattr(params, 'num_workers', 4))
 
