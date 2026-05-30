@@ -281,6 +281,16 @@ class MambaDiffWave(nn.Module):
     self.skip_projection = Conv1d(params.residual_channels, params.residual_channels, 1)
     self.output_projection = Conv1d(params.residual_channels, self.audio_channels, 1)
     nn.init.zeros_(self.output_projection.weight)
+    self.scale_predictor = None
+    if getattr(params, 'predict_amplitude_scale', False):
+      self.scale_predictor = nn.Sequential(
+          Linear(params.condition_dim, params.film_hidden_dim),
+          nn.ReLU(),
+          Linear(params.film_hidden_dim, params.film_hidden_dim),
+          nn.ReLU(),
+          Linear(params.film_hidden_dim, self.audio_channels * 2))
+      nn.init.zeros_(self.scale_predictor[-1].weight)
+      nn.init.zeros_(self.scale_predictor[-1].bias)
 
   def forward(self, audio, diffusion_step, spectrogram=None, physical_params=None):
     # spectrogram can be passed as None even if not unconditional (e.g. if using physical params instead)
@@ -306,6 +316,11 @@ class MambaDiffWave(nn.Module):
     x = F.relu(x)
     x = self.output_projection(x)
     return x
+
+  def predict_scale(self, physical_params=None):
+    if self.scale_predictor is None or physical_params is None:
+      return None
+    return self.scale_predictor(physical_params)
 
 # Alias for backward compatibility
 DiffWave = MambaDiffWave

@@ -1,23 +1,31 @@
 # Core numerical and data dependencies
-numpy>=1.23
-pandas>=1.5
-scipy>=1.9
-tqdm>=4.64
+numpy>=2.2,<3
+pandas>=2.2,<3
+scipy>=1.15,<2
+tqdm>=4.67,<5
 
 # Audio IO and preprocessing
-soundfile>=0.12
+soundfile>=0.13,<1
 
 # PyTorch stack
-# For CUDA-enabled WSL installs, install torch/torchaudio with the matching
-# PyTorch CUDA index URL before or while installing this file.
-torch>=2.1
-torchaudio>=2.1
+# RTX 5090 / Blackwell WSL installs should use the CUDA 13.0 PyTorch wheels.
+# If your driver only supports CUDA 12.x, replace cu130 with the matching
+# official PyTorch index URL before installing.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.11.0+cu130
+torchaudio==2.11.0+cu130
 
 # Experiment tracking and training logs
-wandb>=0.16
-tensorboard>=2.13
+wandb>=0.22,<1
+tensorboard>=2.20,<3
 
 # Mamba-DiffWave default model path.
-# If installation fails on CPU-only environments, run training with
-# `--use_mamba false` or install these after setting up a compatible CUDA toolchain.
-mamba-ssm[causal-conv1d]>=2.2.2
+# Install PyTorch first, then rebuild these against that same torch install:
+#   python -m pip install -r requirements.txt
+#   python -m pip install --no-build-isolation --no-cache-dir --force-reinstall \
+#       causal-conv1d>=1.6.1 mamba-ssm[causal-conv1d]>=2.3.1
+# This avoids undefined-symbol errors from stale CUDA extension wheels.
+ninja>=1.11,<2
+packaging>=24,<26
+einops>=0.8,<1
+transformers>=4.57,<5

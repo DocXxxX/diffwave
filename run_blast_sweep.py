@@ -11,6 +11,7 @@ if str(SRC_DIR) not in sys.path:
 
 import wandb
 import torch
+from diffwave.blast_eval import BlastGenerationEvaluator
 from diffwave.inference import predict, write_blast_csv
 from diffwave.learner import train
 from diffwave.params import AttrDict, apply_blast_augment_level, params as base_params
@@ -40,6 +41,9 @@ PARAM_OVERRIDE_NAMES = [
   'audio_len',
   'audio_channels',
   'audio_clip',
+  'blast_norm_mode',
+  'predict_amplitude_scale',
+  'lambda_scale',
   'condition_dim',
   'residual_layers',
   'residual_channels',
@@ -53,6 +57,7 @@ PARAM_OVERRIDE_NAMES = [
   'validation_batches',
   'checkpoint_interval',
   'num_workers',
+  'pin_memory',
   'split_seed',
   'val_ratio',
   'blast_augment',
@@ -62,6 +67,19 @@ PARAM_OVERRIDE_NAMES = [
   'blast_gain_min',
   'blast_gain_max',
   'sample_clamp',
+  'lambda_mr_stft',
+  'lambda_band_energy',
+  'lambda_envelope',
+  'lambda_peak_rms',
+  'aux_loss_warmup_steps',
+  'aux_loss_timestep_max_ratio',
+  'aux_loss_min_snr',
+  'gen_eval_interval',
+  'gen_eval_subset_size',
+  'gen_eval_samples_per_condition',
+  'full_gen_eval_samples_per_condition',
+  'gen_eval_seed',
+  'gen_eval_fast_sampling',
 ]
 
 SAFETY_DEFAULTS = {
@@ -159,6 +177,55 @@ def _generate_samples(model_dir, config, device):
       print(f'[INFO] Generated sample: {output_path}')
 
 
+def _full_generation_eval(learner, run, config):
+  if learner is None:
+    return
+  evaluator = learner.gen_evaluator
+  if evaluator is None:
+    dataset = getattr(getattr(learner, 'val_dataset', None), 'dataset', None)
+    records = getattr(dataset, 'records', None)
+    stats = getattr(dataset, 'stats', None)
+    if not records or stats is None:
+      print('[WARN] Skip full generation eval because validation records/stats are unavailable.')
+      return
+    evaluator = BlastGenerationEvaluator(records, stats, learner.params)
+
+  output_dir = Path(learner.model_dir) / 'gen_eval'
+  output_csv = output_dir / 'full_metrics.csv'
+  device = next(learner.model.parameters()).device
+  metrics = evaluator.evaluate_model(
+      learner._raw_model(),
+      device=device,
+      subset_size=None,
+      samples_per_condition=int(_config_value(
+          config,
+          'full_gen_eval_samples_per_condition',
+          getattr(learner.params, 'full_gen_eval_samples_per_condition', 3))),
+      fast_sampling=_as_bool(_config_value(
+          config,
+          'gen_eval_fast_sampling',
+          getattr(learner.params, 'gen_eval_fast_sampling', True))),
+      seed=int(_config_value(config, 'gen_eval_seed', getattr(learner.params, 'gen_eval_seed', 20260425))),
+      output_csv=str(output_csv))
+  if not metrics:
+    return
+
+  log_metrics = {
+      'val/full_gen_score_mean': metrics['gen_score_mean'],
+      'val/full_gen_score_best': metrics['gen_score_best'],
+      'val/full_gen_invalid_metric_count': metrics.get('gen_invalid_metric_count_mean', 0.0),
+  }
+  for name, value in metrics.items():
+    if name.startswith('gen_score') or name.startswith('gen_invalid_metric_count'):
+      continue
+    log_metrics[f'val/full_{name}'] = value
+  run.log(log_metrics)
+
+  artifact = wandb.Artifact(f'{run.id}-full-generation-eval', type='generation-eval')
+  artifact.add_file(str(output_csv))
+  run.log_artifact(artifact)
+
+
 def _run_params(config):
   run_params = AttrDict(base_params)
   run_params.override(SAFETY_DEFAULTS)
@@ -205,7 +272,8 @@ def main():
         max_steps=_config_value(config, 'max_steps'),
         fp16=_as_bool(_config_value(config, 'fp16', False)),
         device=_config_value(config, 'device', 'cuda'))
-    train(train_args, run_params, wandb_run=run)
+    learner = train(train_args, run_params, wandb_run=run)
+    _full_generation_eval(learner, run, config)
     _generate_samples(train_args.model_dir, config, train_args.device)
 
 

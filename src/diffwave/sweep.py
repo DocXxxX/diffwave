@@ -3,6 +3,7 @@ import os
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
+from diffwave.blast_eval import BlastGenerationEvaluator
 from diffwave.learner import train
 from diffwave.params import AttrDict, params as base_params
 
@@ -43,8 +44,14 @@ def _sweep_config(max_steps, use_mamba=True, smoke=False):
   return {
       'method': 'bayes',
       'metric': {
-          'name': 'val/loss',
+          'name': 'val/full_gen_score_mean',
           'goal': 'minimize',
+      },
+      'early_terminate': {
+          'type': 'hyperband',
+          'max_iter': 10,
+          's': 2,
+          'eta': 3,
       },
       'parameters': {
           'learning_rate': {
@@ -82,6 +89,39 @@ def _sweep_config(max_steps, use_mamba=True, smoke=False):
           'condition_dim': {
               'value': base_params.condition_dim,
           },
+          'blast_norm_mode': {
+              'value': 'robust_log_scale',
+          },
+          'predict_amplitude_scale': {
+              'value': True,
+          },
+          'lambda_scale': {
+              'values': [0.01, 0.05, 0.1],
+          },
+          'lambda_mr_stft': {
+              'values': [0.0, 0.005, 0.01],
+          },
+          'lambda_band_energy': {
+              'values': [0.0, 0.01, 0.03],
+          },
+          'lambda_envelope': {
+              'values': [0.0, 0.01, 0.03],
+          },
+          'lambda_peak_rms': {
+              'values': [0.0, 0.01, 0.03],
+          },
+          'gen_eval_interval': {
+              'value': 2000,
+          },
+          'gen_eval_subset_size': {
+              'value': 6,
+          },
+          'full_gen_eval_samples_per_condition': {
+              'value': 3,
+          },
+          'gen_eval_fast_sampling': {
+              'value': True,
+          },
           'max_steps': {
               'value': max_steps,
           },
@@ -110,7 +150,31 @@ def main(args):
           max_steps=run.config.max_steps,
           fp16=args.fp16,
           device=args.device)
-      train(train_args, run_params, wandb_run=run)
+      learner = train(train_args, run_params, wandb_run=run)
+      if learner is None:
+        return
+      evaluator = learner.gen_evaluator
+      if evaluator is None:
+        dataset = getattr(getattr(learner, 'val_dataset', None), 'dataset', None)
+        records = getattr(dataset, 'records', None)
+        stats = getattr(dataset, 'stats', None)
+        if not records or stats is None:
+          return
+        evaluator = BlastGenerationEvaluator(records, stats, learner.params)
+      metrics = evaluator.evaluate_model(
+          learner._raw_model(),
+          device=next(learner.model.parameters()).device,
+          subset_size=None,
+          samples_per_condition=getattr(run_params, 'full_gen_eval_samples_per_condition', 3),
+          fast_sampling=getattr(run_params, 'gen_eval_fast_sampling', True),
+          seed=getattr(run_params, 'gen_eval_seed', 20260425),
+          output_csv=os.path.join(run_model_dir, 'full_gen_eval.csv'))
+      if metrics:
+        run.log({
+            'val/full_gen_score_mean': metrics['gen_score_mean'],
+            'val/full_gen_score_best': metrics['gen_score_best'],
+            'val/full_gen_invalid_metric_count': metrics.get('gen_invalid_metric_count_mean', 0.0),
+        })
 
   wandb.agent(sweep_id, function=train_one, count=args.count, project=args.project)
 

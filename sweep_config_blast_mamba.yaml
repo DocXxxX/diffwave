@@ -13,12 +13,18 @@ command:
   - ${interpreter}
   - ${program}
 
-method: random
+method: bayes
 
 
 metric:
-  name: val/loss
+  name: val/full_gen_score_mean
   goal: minimize
+
+early_terminate:
+  type: hyperband
+  max_iter: 10
+  s: 2
+  eta: 3
 
 parameters:
 
@@ -87,6 +93,9 @@ parameters:
   num_workers:
     value: 4
 
+  pin_memory:
+    value: false
+
   validation_interval:
     value: 500
 
@@ -118,6 +127,15 @@ parameters:
   audio_clip:
     value: 8.0
 
+  blast_norm_mode:
+    value: 'robust_log_scale'
+
+  predict_amplitude_scale:
+    value: true
+
+  lambda_scale:
+    values: [0.01, 0.05, 0.10]
+
   blast_augment_level:
     values: ['off', 'conservative', 'medium']
 
@@ -128,7 +146,54 @@ parameters:
     value: false
 
   ################################################
-  # E. Post-Training Sample Generation
+  # E. Auxiliary Generation-Quality Losses
+  ################################################
+
+  lambda_mr_stft:
+    values: [0.0, 0.005, 0.01]
+
+  lambda_band_energy:
+    values: [0.0, 0.01, 0.03]
+
+  lambda_envelope:
+    values: [0.0, 0.01, 0.03]
+
+  lambda_peak_rms:
+    values: [0.0, 0.01, 0.03]
+
+  aux_loss_warmup_steps:
+    values: [1000, 2000, 4000]
+
+  aux_loss_timestep_max_ratio:
+    values: [0.5, 0.6, 0.7]
+
+  aux_loss_min_snr:
+    values: [0.05, 0.1, 0.2]
+
+  ################################################
+  # F. Dynamic Generation Evaluation
+  ################################################
+
+  gen_eval_interval:
+    value: 1000
+
+  gen_eval_subset_size:
+    value: 6
+
+  gen_eval_samples_per_condition:
+    value: 1
+
+  full_gen_eval_samples_per_condition:
+    value: 3
+
+  gen_eval_seed:
+    value: 20260425
+
+  gen_eval_fast_sampling:
+    value: true
+
+  ################################################
+  # G. Post-Training Sample Generation
   ################################################
 
   generate_samples:

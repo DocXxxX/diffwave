@@ -45,6 +45,9 @@ from diffwave.preprocess_params import (
 BLAST_CHANNEL_COLUMNS = ['CH1', 'CH2', 'OT']
 BLAST_MATCH_REPORT = 'blast_match_report.csv'
 BLAST_STATS_FILE = 'blast_stats.json'
+GLOBAL_ZSCORE_NORM = 'global_zscore_clip'
+ROBUST_LOG_SCALE_NORM = 'robust_log_scale'
+SCALE_EPS = 1e-8
 
 
 def _parse_sz_filename(filepath: str) -> Optional[Dict]:
@@ -177,6 +180,42 @@ def _load_blast_waveform(filepath: str) -> np.ndarray:
   return np.nan_to_num(audio, copy=True)
 
 
+def _scale_columns(channel_columns: List[str]) -> List[str]:
+  return [f'log_rms_{col}' for col in channel_columns] + [
+      f'log_peak_{col}' for col in channel_columns]
+
+
+def _safe_std(values: np.ndarray, axis=0) -> np.ndarray:
+  std = values.std(axis=axis)
+  return np.maximum(std, 1e-6)
+
+
+def _center_blast_audio(audio: np.ndarray) -> np.ndarray:
+  center = np.median(audio, axis=1, keepdims=True)
+  return audio - center
+
+
+def _scale_target(audio: np.ndarray) -> np.ndarray:
+  centered = _center_blast_audio(audio.astype(np.float64))
+  rms = np.sqrt(np.mean(np.square(centered), axis=1))
+  peak = np.max(np.abs(centered), axis=1)
+  return np.concatenate([
+      np.log(np.maximum(rms, SCALE_EPS)),
+      np.log(np.maximum(peak, SCALE_EPS)),
+  ]).astype(np.float32)
+
+
+def _robust_normalize(audio: np.ndarray) -> np.ndarray:
+  centered = _center_blast_audio(audio.astype(np.float64))
+  abs_centered = np.abs(centered)
+  clip_value = np.percentile(abs_centered, 99, axis=1, keepdims=True)
+  clip_value = np.maximum(clip_value, SCALE_EPS)
+  clipped = np.clip(centered, -clip_value, clip_value)
+  scale = np.sqrt(np.mean(np.square(clipped), axis=1, keepdims=True))
+  scale = np.maximum(scale, SCALE_EPS)
+  return (centered / scale).astype(np.float32)
+
+
 def _crop_or_pad_peak(audio: np.ndarray, target_len: int) -> np.ndarray:
   length = audio.shape[1]
   if length == target_len:
@@ -268,13 +307,25 @@ def _compute_blast_stats(records: List[Dict], params) -> Dict:
   param_std = param_values.std(axis=0)
   param_std = np.maximum(param_std, 1e-6)
 
+  scale_values = []
+  for record in records:
+    audio = _crop_or_pad_peak(_load_blast_waveform(record['path']), params.audio_len)
+    scale_values.append(_scale_target(audio))
+  scale_values = np.stack(scale_values)
+  scale_mean = scale_values.mean(axis=0)
+  scale_std = _safe_std(scale_values, axis=0)
+
   return {
       'channel_columns': BLAST_CHANNEL_COLUMNS,
       'param_columns': BLAST_PARAM_COLUMNS,
+      'scale_columns': _scale_columns(BLAST_CHANNEL_COLUMNS),
       'channel_mean': channel_mean.astype(float).tolist(),
       'channel_std': channel_std.astype(float).tolist(),
       'param_mean': param_mean.astype(float).tolist(),
       'param_std': param_std.astype(float).tolist(),
+      'scale_mean': scale_mean.astype(float).tolist(),
+      'scale_std': scale_std.astype(float).tolist(),
+      'norm_mode': getattr(params, 'blast_norm_mode', GLOBAL_ZSCORE_NORM),
       'sample_rate': int(params.sample_rate),
       'audio_len': int(params.audio_len),
   }
@@ -304,6 +355,11 @@ class BlastVibrationDataset(torch.utils.data.Dataset):
     self.channel_std = np.asarray(stats['channel_std'], dtype=np.float32)[:, None]
     self.param_mean = np.asarray(stats['param_mean'], dtype=np.float32)
     self.param_std = np.asarray(stats['param_std'], dtype=np.float32)
+    scale_dim = len(BLAST_CHANNEL_COLUMNS) * 2
+    self.scale_mean = np.asarray(stats.get('scale_mean', [0.0] * scale_dim), dtype=np.float32)
+    self.scale_std = np.asarray(stats.get('scale_std', [1.0] * scale_dim), dtype=np.float32)
+    self.scale_std = np.maximum(self.scale_std, 1e-6)
+    self.norm_mode = getattr(params, 'blast_norm_mode', stats.get('norm_mode', GLOBAL_ZSCORE_NORM))
 
   def __len__(self):
     return len(self.records)
@@ -315,15 +371,21 @@ class BlastVibrationDataset(torch.utils.data.Dataset):
       audio = _augment_blast_waveform(raw_audio, self.params)
     else:
       audio = _crop_or_pad_peak(raw_audio, self.params.audio_len)
-    audio = (audio - self.channel_mean) / self.channel_std
+    scale_target = _scale_target(audio)
+    if self.norm_mode == ROBUST_LOG_SCALE_NORM:
+      audio = _robust_normalize(audio)
+    else:
+      audio = (audio - self.channel_mean) / self.channel_std
     audio_clip = getattr(self.params, 'audio_clip', None)
     if audio_clip is not None and audio_clip > 0:
       audio = np.clip(audio, -audio_clip, audio_clip)
     physical_params = (record['physical_params'] - self.param_mean) / self.param_std
+    scale_target = (scale_target - self.scale_mean) / self.scale_std
 
     return {
         'audio': torch.from_numpy(audio.astype(np.float32)),
         'physical_params': torch.from_numpy(physical_params.astype(np.float32)),
+        'scale_target': torch.from_numpy(scale_target.astype(np.float32)),
         'spectrogram': None,
         'path': record['path'],
     }
@@ -338,10 +400,12 @@ class BlastCollator:
   def collate(self, minibatch):
     audio = torch.stack([record['audio'] for record in minibatch])
     physical_params = torch.stack([record['physical_params'] for record in minibatch])
+    scale_target = torch.stack([record['scale_target'] for record in minibatch])
 
     return {
         'audio': audio,
         'physical_params': physical_params,
+        'scale_target': scale_target,
         'spectrogram': None,
         'path': [record['path'] for record in minibatch],
     }
@@ -399,7 +463,7 @@ def create_blast_dataloaders(data_dirs, params_csv_path, params, model_dir=None,
       shuffle=(train_sampler is None),
       num_workers=num_workers,
       sampler=train_sampler,
-      pin_memory=torch.cuda.is_available(),
+      pin_memory=bool(getattr(params, 'pin_memory', False)),
       drop_last=True)
 
   val_loader = None
@@ -410,7 +474,7 @@ def create_blast_dataloaders(data_dirs, params_csv_path, params, model_dir=None,
         collate_fn=BlastCollator(params).collate,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=bool(getattr(params, 'pin_memory', False)),
         drop_last=False)
 
   return train_loader, val_loader

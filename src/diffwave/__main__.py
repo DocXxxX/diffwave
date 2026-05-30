@@ -55,6 +55,9 @@ def _apply_overrides(args):
       'audio_len',
       'audio_channels',
       'audio_clip',
+      'blast_norm_mode',
+      'predict_amplitude_scale',
+      'lambda_scale',
       'condition_dim',
       'residual_layers',
       'residual_channels',
@@ -68,6 +71,7 @@ def _apply_overrides(args):
       'validation_batches',
       'checkpoint_interval',
       'num_workers',
+      'pin_memory',
       'split_seed',
       'val_ratio',
       'data_format',
@@ -81,6 +85,19 @@ def _apply_overrides(args):
       'wandb_project',
       'wandb_run_name',
       'sample_clamp',
+      'lambda_mr_stft',
+      'lambda_band_energy',
+      'lambda_envelope',
+      'lambda_peak_rms',
+      'aux_loss_warmup_steps',
+      'aux_loss_timestep_max_ratio',
+      'aux_loss_min_snr',
+      'gen_eval_interval',
+      'gen_eval_subset_size',
+      'gen_eval_samples_per_condition',
+      'full_gen_eval_samples_per_condition',
+      'gen_eval_seed',
+      'gen_eval_fast_sampling',
   ]
   overrides = { name: getattr(args, name) for name in override_names if getattr(args, name, None) is not None }
   augment_level = overrides.pop('blast_augment_level', None)
@@ -135,6 +152,9 @@ if __name__ == '__main__':
   parser.add_argument('--audio_len', type=int)
   parser.add_argument('--audio_channels', type=int)
   parser.add_argument('--audio_clip', type=float)
+  parser.add_argument('--blast_norm_mode', choices=['global_zscore_clip', 'robust_log_scale'])
+  parser.add_argument('--predict_amplitude_scale', type=_str_to_bool)
+  parser.add_argument('--lambda_scale', type=float)
   parser.add_argument('--condition_dim', type=int)
   parser.add_argument('--residual_layers', type=int)
   parser.add_argument('--residual_channels', type=int)
@@ -148,9 +168,23 @@ if __name__ == '__main__':
   parser.add_argument('--validation_batches', type=int)
   parser.add_argument('--checkpoint_interval', type=int)
   parser.add_argument('--num_workers', type=int)
+  parser.add_argument('--pin_memory', type=_str_to_bool)
   parser.add_argument('--split_seed', type=int)
   parser.add_argument('--val_ratio', type=float)
   parser.add_argument('--sample_clamp', type=_str_to_bool)
+  parser.add_argument('--lambda_mr_stft', type=float)
+  parser.add_argument('--lambda_band_energy', type=float)
+  parser.add_argument('--lambda_envelope', type=float)
+  parser.add_argument('--lambda_peak_rms', type=float)
+  parser.add_argument('--aux_loss_warmup_steps', type=int)
+  parser.add_argument('--aux_loss_timestep_max_ratio', type=float)
+  parser.add_argument('--aux_loss_min_snr', type=float)
+  parser.add_argument('--gen_eval_interval', type=int)
+  parser.add_argument('--gen_eval_subset_size', type=int)
+  parser.add_argument('--gen_eval_samples_per_condition', type=int)
+  parser.add_argument('--full_gen_eval_samples_per_condition', type=int)
+  parser.add_argument('--gen_eval_seed', type=int)
+  parser.add_argument('--gen_eval_fast_sampling', type=_str_to_bool)
 
   parser.add_argument('--use_wandb', action='store_true', default=None,
       help='log training metrics to W&B')

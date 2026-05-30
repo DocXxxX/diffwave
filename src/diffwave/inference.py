@@ -34,6 +34,8 @@ models = {}
 
 
 def _default_device(device):
+  if isinstance(device, torch.device):
+    return device
   if device:
     return torch.device(device)
   return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -58,12 +60,16 @@ def _load_stats(model_dir, stats_path=None):
 
 def _checkpoint_params(checkpoint, overrides=None):
   model_params = AttrDict(base_params)
-  model_params.override(checkpoint.get('params'))
+  checkpoint_params = checkpoint.get('params') or {}
+  model_params.override(checkpoint_params)
   state = checkpoint.get('model', {})
   if 'input_projection.weight' in state:
     model_params.audio_channels = int(state['input_projection.weight'].shape[1])
   if 'output_projection.weight' in state:
     model_params.audio_channels = int(state['output_projection.weight'].shape[0])
+  if 'predict_amplitude_scale' not in checkpoint_params and not any(
+      key.startswith('scale_predictor.') for key in state):
+    model_params.predict_amplitude_scale = False
   model_params.override(overrides)
   return model_params
 
@@ -86,12 +92,118 @@ def _prepare_physical_params(physical_params, stats, device):
   return physical_params.to(device), physical_params.shape[0]
 
 
-def _denormalize_audio(audio, stats):
+def _denormalize_scale(predicted_scale, stats, channels):
+  if predicted_scale is None or stats is None:
+    return None
+  if 'scale_mean' not in stats or 'scale_std' not in stats:
+    return None
+  mean = torch.tensor(stats['scale_mean'], device=predicted_scale.device, dtype=predicted_scale.dtype).view(1, -1)
+  std = torch.tensor(stats['scale_std'], device=predicted_scale.device, dtype=predicted_scale.dtype).view(1, -1)
+  raw_scale = predicted_scale * std + mean
+  log_rms = raw_scale[:, :channels]
+  return torch.exp(log_rms).view(predicted_scale.shape[0], channels, 1)
+
+
+def _denormalize_audio(audio, stats, model=None, physical_params=None):
   if stats is None:
     return audio
+  norm_mode = stats.get('norm_mode', 'global_zscore_clip')
+  if norm_mode == 'robust_log_scale':
+    scale = None
+    if model is not None and hasattr(model, 'predict_scale') and physical_params is not None:
+      scale = _denormalize_scale(model.predict_scale(physical_params), stats, audio.shape[1])
+    if scale is None:
+      if 'scale_mean' in stats:
+        mean = torch.tensor(stats['scale_mean'], device=audio.device, dtype=audio.dtype).view(1, -1)
+        scale = torch.exp(mean[:, :audio.shape[1]]).view(1, audio.shape[1], 1)
+      else:
+        scale = torch.ones(1, audio.shape[1], 1, device=audio.device, dtype=audio.dtype)
+    return audio * scale
   mean = torch.tensor(stats['channel_mean'], device=audio.device, dtype=audio.dtype).view(1, -1, 1)
   std = torch.tensor(stats['channel_std'], device=audio.device, dtype=audio.dtype).view(1, -1, 1)
   return audio * std + mean
+
+
+def _load_model(model_dir, params, device):
+  checkpoint = torch.load(_checkpoint_path(model_dir), map_location=device)
+  model_params = _checkpoint_params(checkpoint, params)
+  model = DiffWave(model_params).to(device)
+  missing, unexpected = model.load_state_dict(checkpoint['model'], strict=False)
+  scale_missing = [key for key in missing if key.startswith('scale_predictor.')]
+  other_missing = [key for key in missing if not key.startswith('scale_predictor.')]
+  if other_missing or unexpected:
+    raise RuntimeError(
+        f'Checkpoint/model mismatch. Missing={other_missing}, unexpected={unexpected}.')
+  if scale_missing:
+    model.params.predict_amplitude_scale = False
+  model.eval()
+  return model
+
+
+def generate_audio(model,
+                   spectrogram=None,
+                   physical_params=None,
+                   stats=None,
+                   device=None,
+                   fast_sampling=False,
+                   generator=None):
+  device = _default_device(device)
+  model = model.to(device)
+  if stats is not None:
+    if 'sample_rate' in stats and int(stats['sample_rate']) != int(model.params.sample_rate):
+      raise ValueError(
+          f"sample_rate mismatch: stats={stats['sample_rate']}, model={model.params.sample_rate}.")
+    if 'audio_len' in stats and int(stats['audio_len']) != int(model.params.audio_len):
+      raise ValueError(
+          f"audio_len mismatch: stats={stats['audio_len']}, model={model.params.audio_len}.")
+  physical_params, batch_size = _prepare_physical_params(physical_params, stats, device)
+
+  if spectrogram is not None:
+    if len(spectrogram.shape) == 2:
+      spectrogram = spectrogram.unsqueeze(0)
+    spectrogram = spectrogram.to(device)
+    batch_size = spectrogram.shape[0]
+
+  training_noise_schedule = np.array(model.params.noise_schedule)
+  inference_noise_schedule = np.array(model.params.inference_noise_schedule) if fast_sampling else training_noise_schedule
+
+  talpha = 1 - training_noise_schedule
+  talpha_cum = np.cumprod(talpha)
+
+  beta = inference_noise_schedule
+  alpha = 1 - beta
+  alpha_cum = np.cumprod(alpha)
+
+  T = []
+  for s in range(len(inference_noise_schedule)):
+    for t in range(len(training_noise_schedule) - 1):
+      if talpha_cum[t+1] <= alpha_cum[s] <= talpha_cum[t]:
+        twiddle = (talpha_cum[t]**0.5 - alpha_cum[s]**0.5) / (talpha_cum[t]**0.5 - talpha_cum[t+1]**0.5)
+        T.append(t + twiddle)
+        break
+  T = np.array(T, dtype=np.float32)
+
+  audio = torch.randn(
+      batch_size,
+      getattr(model.params, 'audio_channels', 1),
+      model.params.audio_len,
+      device=device,
+      generator=generator)
+
+  for n in range(len(alpha) - 1, -1, -1):
+    c1 = 1 / alpha[n]**0.5
+    c2 = beta[n] / (1 - alpha_cum[n])**0.5
+    diffusion_step = torch.full([batch_size], T[n], device=audio.device)
+    pred = model(audio, diffusion_step, spectrogram, physical_params)
+    audio = c1 * (audio - c2 * pred)
+    if n > 0:
+      noise = torch.randn(audio.shape, device=audio.device, dtype=audio.dtype, generator=generator)
+      sigma = ((1.0 - alpha_cum[n-1]) / (1.0 - alpha_cum[n]) * beta[n])**0.5
+      audio += sigma * noise
+    if getattr(model.params, 'sample_clamp', False):
+      audio = torch.clamp(audio, -1.0, 1.0)
+
+  return _denormalize_audio(audio, stats, model=model, physical_params=physical_params), model.params.sample_rate
 
 
 def predict(spectrogram=None, physical_params=None, model_dir=None, params=None, device=None, fast_sampling=False, stats_path=None):
@@ -100,62 +212,17 @@ def predict(spectrogram=None, physical_params=None, model_dir=None, params=None,
   stats = _load_stats(model_dir, stats_path)
 
   if cache_key not in models:
-    checkpoint = torch.load(_checkpoint_path(model_dir), map_location=device)
-    model_params = _checkpoint_params(checkpoint, params)
-    model = DiffWave(model_params).to(device)
-    model.load_state_dict(checkpoint['model'])
-    model.eval()
-    models[cache_key] = model
+    models[cache_key] = _load_model(model_dir, params, device)
 
   model = models[cache_key]
-  physical_params, batch_size = _prepare_physical_params(physical_params, stats, device)
-
   with torch.no_grad():
-    training_noise_schedule = np.array(model.params.noise_schedule)
-    inference_noise_schedule = np.array(model.params.inference_noise_schedule) if fast_sampling else training_noise_schedule
-
-    talpha = 1 - training_noise_schedule
-    talpha_cum = np.cumprod(talpha)
-
-    beta = inference_noise_schedule
-    alpha = 1 - beta
-    alpha_cum = np.cumprod(alpha)
-
-    T = []
-    for s in range(len(inference_noise_schedule)):
-      for t in range(len(training_noise_schedule) - 1):
-        if talpha_cum[t+1] <= alpha_cum[s] <= talpha_cum[t]:
-          twiddle = (talpha_cum[t]**0.5 - alpha_cum[s]**0.5) / (talpha_cum[t]**0.5 - talpha_cum[t+1]**0.5)
-          T.append(t + twiddle)
-          break
-    T = np.array(T, dtype=np.float32)
-
-    if spectrogram is not None:
-      if len(spectrogram.shape) == 2:
-        spectrogram = spectrogram.unsqueeze(0)
-      spectrogram = spectrogram.to(device)
-      batch_size = spectrogram.shape[0]
-
-    audio = torch.randn(
-        batch_size,
-        getattr(model.params, 'audio_channels', 1),
-        model.params.audio_len,
-        device=device)
-
-    for n in range(len(alpha) - 1, -1, -1):
-      c1 = 1 / alpha[n]**0.5
-      c2 = beta[n] / (1 - alpha_cum[n])**0.5
-      diffusion_step = torch.full([batch_size], T[n], device=audio.device)
-      pred = model(audio, diffusion_step, spectrogram, physical_params)
-      audio = c1 * (audio - c2 * pred)
-      if n > 0:
-        noise = torch.randn_like(audio)
-        sigma = ((1.0 - alpha_cum[n-1]) / (1.0 - alpha_cum[n]) * beta[n])**0.5
-        audio += sigma * noise
-      if getattr(model.params, 'sample_clamp', False):
-        audio = torch.clamp(audio, -1.0, 1.0)
-
-  return _denormalize_audio(audio, stats), model.params.sample_rate
+    return generate_audio(
+        model,
+        spectrogram=spectrogram,
+        physical_params=physical_params,
+        stats=stats,
+        device=device,
+        fast_sampling=fast_sampling)
 
 
 def write_blast_csv(output_path, audio, sample_rate):
