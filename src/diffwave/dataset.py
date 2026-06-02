@@ -47,7 +47,17 @@ BLAST_MATCH_REPORT = 'blast_match_report.csv'
 BLAST_STATS_FILE = 'blast_stats.json'
 GLOBAL_ZSCORE_NORM = 'global_zscore_clip'
 ROBUST_LOG_SCALE_NORM = 'robust_log_scale'
+BLAST_CONDITION_LEGACY = 'legacy'
+BLAST_CONDITION_ENHANCED = 'enhanced'
 SCALE_EPS = 1e-8
+DERIVED_CONDITION_COLUMNS = [
+    'Scaled_Distance_Sqrt_Qmax',
+    'Scaled_Distance_Cuberoot_Qmax',
+    'Avg_Charge_Per_Hole',
+    'Log_Q_max',
+    'Log_Q_total',
+    'Log_Distance_R',
+]
 
 
 def _parse_sz_filename(filepath: str) -> Optional[Dict]:
@@ -74,6 +84,135 @@ def _param_vector(row: pd.Series) -> Optional[np.ndarray]:
   if any(pd.isna(row.get(col, np.nan)) for col in BLAST_PARAM_COLUMNS):
     return None
   return row[BLAST_PARAM_COLUMNS].to_numpy(dtype=np.float32)
+
+
+def _safe_positive(value: float) -> float:
+  return max(float(value), SCALE_EPS)
+
+
+def _one_hot_columns(prefix: str, values: List) -> List[str]:
+  return [f'{prefix}_{value}' for value in values]
+
+
+def _mode_value(values: List, fallback):
+  if not values:
+    return fallback
+  counts = {}
+  for value in values:
+    counts[value] = counts.get(value, 0) + 1
+  return sorted(counts.items(), key=lambda item: (-item[1], str(item[0])))[0][0]
+
+
+def _derived_condition_values(physical_params: np.ndarray) -> np.ndarray:
+  values = {name: float(value) for name, value in zip(BLAST_PARAM_COLUMNS, physical_params)}
+  q_max = _safe_positive(values['Q_max'])
+  q_total = _safe_positive(values['Q_total'])
+  hole_num = _safe_positive(values['Hole_Num'])
+  distance = _safe_positive(values['Distance_R'])
+  return np.asarray([
+      distance / np.sqrt(q_max),
+      distance / np.cbrt(q_max),
+      q_total / hole_num,
+      np.log(q_max),
+      np.log(q_total),
+      np.log(distance),
+  ], dtype=np.float32)
+
+
+def build_blast_condition_schema(records: List[Dict], condition_mode: str = BLAST_CONDITION_ENHANCED) -> Dict:
+  condition_mode = condition_mode or BLAST_CONDITION_LEGACY
+  if condition_mode == BLAST_CONDITION_LEGACY:
+    return {
+        'mode': BLAST_CONDITION_LEGACY,
+        'columns': list(BLAST_PARAM_COLUMNS),
+        'base_param_columns': list(BLAST_PARAM_COLUMNS),
+        'derived_columns': [],
+        'monitor_ids': [],
+        'instruments': [],
+        'default_monitor_id': None,
+        'default_instrument': None,
+    }
+  if condition_mode != BLAST_CONDITION_ENHANCED:
+    raise ValueError(f'Invalid blast_condition_mode: {condition_mode}')
+
+  monitor_ids = sorted({int(record['monitor_id']) for record in records})
+  instruments = sorted({str(record['instrument']) for record in records})
+  columns = (
+      list(BLAST_PARAM_COLUMNS) +
+      list(DERIVED_CONDITION_COLUMNS) +
+      _one_hot_columns('Monitor_ID', monitor_ids) +
+      _one_hot_columns('Instrument', instruments))
+  return {
+      'mode': BLAST_CONDITION_ENHANCED,
+      'columns': columns,
+      'base_param_columns': list(BLAST_PARAM_COLUMNS),
+      'derived_columns': list(DERIVED_CONDITION_COLUMNS),
+      'monitor_ids': monitor_ids,
+      'instruments': instruments,
+      'default_monitor_id': _mode_value([int(record['monitor_id']) for record in records], monitor_ids[0] if monitor_ids else None),
+      'default_instrument': _mode_value([str(record['instrument']) for record in records], instruments[0] if instruments else None),
+  }
+
+
+def condition_schema_from_stats(stats: Optional[Dict]) -> Dict:
+  if stats is not None and 'condition_schema' in stats:
+    return stats['condition_schema']
+  columns = list(stats.get('param_columns', BLAST_PARAM_COLUMNS)) if stats is not None else list(BLAST_PARAM_COLUMNS)
+  return {
+      'mode': BLAST_CONDITION_LEGACY,
+      'columns': columns,
+      'base_param_columns': list(BLAST_PARAM_COLUMNS),
+      'derived_columns': [],
+      'monitor_ids': [],
+      'instruments': [],
+      'default_monitor_id': None,
+      'default_instrument': None,
+  }
+
+
+def build_blast_condition_vector(physical_params,
+                                 monitor_id=None,
+                                 instrument=None,
+                                 stats: Optional[Dict] = None,
+                                 condition_schema: Optional[Dict] = None) -> np.ndarray:
+  schema = condition_schema or condition_schema_from_stats(stats)
+  physical_params = np.asarray(physical_params, dtype=np.float32)
+  if physical_params.ndim != 1:
+    raise ValueError(f'Expected a 1-D blast parameter vector, got shape {physical_params.shape}.')
+
+  mode = schema.get('mode', BLAST_CONDITION_LEGACY)
+  columns = schema.get('columns', BLAST_PARAM_COLUMNS)
+  if mode == BLAST_CONDITION_LEGACY:
+    if len(physical_params) != len(columns):
+      raise ValueError(f'Expected {len(columns)} blast parameters, got {len(physical_params)}.')
+    return physical_params.astype(np.float32)
+
+  if len(physical_params) != len(BLAST_PARAM_COLUMNS):
+    if len(physical_params) == len(columns):
+      return physical_params.astype(np.float32)
+    raise ValueError(
+        f'Expected {len(BLAST_PARAM_COLUMNS)} base blast parameters or {len(columns)} enhanced conditions, got {len(physical_params)}.')
+
+  monitor_ids = [int(value) for value in schema.get('monitor_ids', [])]
+  instruments = [str(value) for value in schema.get('instruments', [])]
+  if monitor_id is None:
+    monitor_id = schema.get('default_monitor_id')
+  if instrument is None:
+    instrument = schema.get('default_instrument')
+  monitor_id = int(monitor_id) if monitor_id is not None else None
+  instrument = str(instrument) if instrument is not None else None
+
+  monitor_values = np.asarray([1.0 if monitor_id == value else 0.0 for value in monitor_ids], dtype=np.float32)
+  instrument_values = np.asarray([1.0 if instrument == value else 0.0 for value in instruments], dtype=np.float32)
+  vector = np.concatenate([
+      physical_params.astype(np.float32),
+      _derived_condition_values(physical_params),
+      monitor_values,
+      instrument_values,
+  ]).astype(np.float32)
+  if len(vector) != len(columns):
+    raise ValueError(f'Condition vector length {len(vector)} does not match schema length {len(columns)}.')
+  return vector
 
 
 def _resolve_ambiguous_param_row(matches: pd.DataFrame, meta: Dict) -> Optional[pd.Series]:
@@ -302,7 +441,16 @@ def _compute_blast_stats(records: List[Dict], params) -> Dict:
   channel_var = channel_sumsq / channel_count - channel_mean ** 2
   channel_std = np.sqrt(np.maximum(channel_var, 1e-12))
 
-  param_values = np.stack([record['physical_params'] for record in records])
+  condition_mode = getattr(params, 'blast_condition_mode', BLAST_CONDITION_LEGACY)
+  condition_schema = build_blast_condition_schema(records, condition_mode)
+  param_values = np.stack([
+      build_blast_condition_vector(
+          record['physical_params'],
+          monitor_id=record.get('monitor_id'),
+          instrument=record.get('instrument'),
+          condition_schema=condition_schema)
+      for record in records
+  ])
   param_mean = param_values.mean(axis=0)
   param_std = param_values.std(axis=0)
   param_std = np.maximum(param_std, 1e-6)
@@ -317,7 +465,9 @@ def _compute_blast_stats(records: List[Dict], params) -> Dict:
 
   return {
       'channel_columns': BLAST_CHANNEL_COLUMNS,
-      'param_columns': BLAST_PARAM_COLUMNS,
+      'param_columns': condition_schema['columns'],
+      'base_param_columns': BLAST_PARAM_COLUMNS,
+      'condition_schema': condition_schema,
       'scale_columns': _scale_columns(BLAST_CHANNEL_COLUMNS),
       'channel_mean': channel_mean.astype(float).tolist(),
       'channel_std': channel_std.astype(float).tolist(),
@@ -328,6 +478,7 @@ def _compute_blast_stats(records: List[Dict], params) -> Dict:
       'norm_mode': getattr(params, 'blast_norm_mode', GLOBAL_ZSCORE_NORM),
       'sample_rate': int(params.sample_rate),
       'audio_len': int(params.audio_len),
+      'split_mode': getattr(params, 'blast_split_mode', 'record'),
   }
 
 
@@ -379,7 +530,12 @@ class BlastVibrationDataset(torch.utils.data.Dataset):
     audio_clip = getattr(self.params, 'audio_clip', None)
     if audio_clip is not None and audio_clip > 0:
       audio = np.clip(audio, -audio_clip, audio_clip)
-    physical_params = (record['physical_params'] - self.param_mean) / self.param_std
+    physical_params = build_blast_condition_vector(
+        record['physical_params'],
+        monitor_id=record.get('monitor_id'),
+        instrument=record.get('instrument'),
+        stats=self.stats)
+    physical_params = (physical_params - self.param_mean) / self.param_std
     scale_target = (scale_target - self.scale_mean) / self.scale_std
 
     return {
@@ -411,7 +567,7 @@ class BlastCollator:
     }
 
 
-def _split_records(records: List[Dict], val_ratio: float, seed: int) -> Tuple[List[Dict], List[Dict]]:
+def _split_records_by_record(records: List[Dict], val_ratio: float, seed: int) -> Tuple[List[Dict], List[Dict]]:
   records = list(records)
   random.Random(seed).shuffle(records)
   if val_ratio <= 0 or len(records) < 2:
@@ -419,6 +575,43 @@ def _split_records(records: List[Dict], val_ratio: float, seed: int) -> Tuple[Li
   val_count = max(1, int(round(len(records) * val_ratio)))
   val_count = min(val_count, len(records) - 1)
   return records[val_count:], records[:val_count]
+
+
+def _split_records_by_event(records: List[Dict], val_ratio: float, seed: int) -> Tuple[List[Dict], List[Dict]]:
+  records = list(records)
+  if val_ratio <= 0 or len(records) < 2:
+    return records, []
+
+  event_ids = sorted({str(record.get('event_id', '')) for record in records})
+  if len(event_ids) < 2:
+    return _split_records_by_record(records, val_ratio, seed)
+
+  random.Random(seed).shuffle(event_ids)
+  target_val_count = max(1, int(round(len(records) * val_ratio)))
+  val_events = set()
+  val_count = 0
+  for event_id in event_ids:
+    event_count = sum(1 for record in records if str(record.get('event_id', '')) == event_id)
+    if len(val_events) > 0 and val_count >= target_val_count:
+      break
+    if len(val_events) >= len(event_ids) - 1:
+      break
+    val_events.add(event_id)
+    val_count += event_count
+
+  train_records = [record for record in records if str(record.get('event_id', '')) not in val_events]
+  val_records = [record for record in records if str(record.get('event_id', '')) in val_events]
+  if not train_records or not val_records:
+    return _split_records_by_record(records, val_ratio, seed)
+  return train_records, val_records
+
+
+def _split_records(records: List[Dict], val_ratio: float, seed: int, split_mode: str = 'record') -> Tuple[List[Dict], List[Dict]]:
+  if split_mode == 'event':
+    return _split_records_by_event(records, val_ratio, seed)
+  if split_mode != 'record':
+    raise ValueError(f'Invalid blast_split_mode: {split_mode}')
+  return _split_records_by_record(records, val_ratio, seed)
 
 
 def from_blast_data(data_dirs, params_csv_path, params, is_distributed=False):
@@ -446,8 +639,10 @@ def create_blast_dataloaders(data_dirs, params_csv_path, params, model_dir=None,
   train_records, val_records = _split_records(
       records,
       getattr(params, 'val_ratio', 0.15),
-      getattr(params, 'split_seed', 2021))
+      getattr(params, 'split_seed', 2021),
+      getattr(params, 'blast_split_mode', 'record'))
   stats = _compute_blast_stats(train_records, params)
+  params.condition_dim = len(stats['param_mean'])
   if stats_path:
     save_blast_stats(stats, stats_path)
 

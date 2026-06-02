@@ -73,6 +73,30 @@ tensorboard --logdir /path/to/model/dir --bind_all
 
 You should expect to hear intelligible (but noisy) speech by ~8k steps (~1.5h on a 2080 Ti).
 
+### Blast vibration workflow
+Blast CSV training defaults to enhanced physical conditioning and event-level validation splits. The enhanced condition vector keeps the original blast parameters and adds derived scaled-distance/log-charge features plus monitor/instrument one-hot features saved in `blast_stats.json`.
+
+Train with the local blast dataset:
+```
+python -m diffwave sweep_runs/blast_mamba dataset/SZ_blast --params_csv "Final_20260411 Parameter Table.csv" --data_format blast_csv
+```
+
+Run waveform diagnostics against validation records:
+```
+python -m diffwave.blast_diagnostics sweep_runs/blast_mamba/<run-id> --data_dirs dataset/SZ_blast --params_csv "Final_20260411 Parameter Table.csv" --fast
+```
+
+Enhanced checkpoints accept optional monitor metadata at inference time:
+```
+python -m diffwave.inference sweep_runs/blast_mamba/<run-id> --blast_params "2.2,151.8,76,28.6,74.8,57.5,13.8,6.5" --monitor_id 3 --instrument WB --output output.csv
+```
+
+On this workstation, validation should be run from WSL with:
+```
+cd /mnt/e/Sync-IDWLF/Diffwave/DiffWave/diffwave
+/home/lxy/miniconda3/envs/diffwave-cu130/bin/python -m diffwave.blast_diagnostics sweep_runs/blast_mamba/<run-id> --data_dirs dataset/SZ_blast --params_csv "Final_20260411 Parameter Table.csv" --fast
+```
+
 #### Multi-GPU training
 By default, this implementation uses as many GPUs in parallel as returned by [`torch.cuda.device_count()`](https://pytorch.org/docs/stable/cuda.html#torch.cuda.device_count). You can specify which GPUs to use by setting the [`CUDA_DEVICES_AVAILABLE`](https://developer.nvidia.com/blog/cuda-pro-tip-control-gpu-visibility-cuda_visible_devices/) environment variable before running the training module.
 

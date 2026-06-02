@@ -19,13 +19,14 @@ from diffwave.inference import generate_audio
 DEFAULT_FREQ_BANDS = [0, 20, 40, 80, 130, 250, 500, 1000, 2000, 4000]
 DEFAULT_STFT_FFT_SIZES = [256, 512, 1024]
 GEN_SCORE_WEIGHTS = {
-    'rms_error': 0.15,
-    'max_abs_error': 0.10,
-    'peak_to_peak_error': 0.10,
-    'band_energy_error': 0.15,
+    'rms_error': 0.12,
+    'max_abs_error': 0.08,
+    'peak_to_peak_error': 0.08,
+    'band_energy_error': 0.14,
     'stft_lsd_error': 0.15,
-    'envelope_error': 0.15,
-    'peak_time_error': 0.10,
+    'envelope_error': 0.14,
+    'cumulative_energy_error': 0.10,
+    'peak_time_error': 0.09,
     'channel_corr_error': 0.05,
     'dominant_freq_error': 0.05,
 }
@@ -163,6 +164,18 @@ def _envelope_error(generated: np.ndarray, real: np.ndarray) -> Tuple[float, int
   return float(np.mean(errors)), invalid
 
 
+def _cumulative_energy_error(generated: np.ndarray, real: np.ndarray) -> Tuple[float, int]:
+  gen_energy = np.cumsum(np.square(generated), axis=1)
+  real_energy = np.cumsum(np.square(real), axis=1)
+  gen_total = gen_energy[:, -1:]
+  real_total = real_energy[:, -1:]
+  invalid = int(np.any(gen_total <= EPS) or np.any(real_total <= EPS))
+  gen_energy = gen_energy / (gen_total + EPS)
+  real_energy = real_energy / (real_total + EPS)
+  value, bad = _clip01(np.mean(np.abs(gen_energy - real_energy)))
+  return value, bad + invalid
+
+
 def _peak_time(audio: np.ndarray, sample_rate: int) -> float:
   index = int(np.argmax(np.max(np.abs(audio), axis=0)))
   return index / sample_rate
@@ -220,6 +233,9 @@ def compute_generation_metrics(generated: np.ndarray,
   envelope_error, bad = _envelope_error(generated, real)
   invalid_count += bad
 
+  cumulative_energy_error, bad = _cumulative_energy_error(generated, real)
+  invalid_count += bad
+
   peak_time_error, bad = _clip01(abs(_peak_time(generated, sample_rate) - _peak_time(real, sample_rate)) / 0.25)
   invalid_count += bad
 
@@ -240,6 +256,7 @@ def compute_generation_metrics(generated: np.ndarray,
       'band_energy_error': band_energy_error,
       'stft_lsd_error': stft_lsd_error,
       'envelope_error': envelope_error,
+      'cumulative_energy_error': cumulative_energy_error,
       'peak_time_error': peak_time_error,
       'channel_corr_error': channel_corr_error,
       'dominant_freq_error': dominant_frequency_error,
@@ -309,6 +326,8 @@ class BlastGenerationEvaluator:
               stats=self.stats,
               device=device,
               fast_sampling=fast_sampling,
+              monitor_id=record.get('monitor_id'),
+              instrument=record.get('instrument'),
               generator=generator)
           generated = generated.detach().cpu().numpy()[0]
           metrics = compute_generation_metrics(

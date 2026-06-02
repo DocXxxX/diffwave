@@ -50,6 +50,7 @@ Thumbs.db
 
 # Output directories
 AudioTest/
+diagnostics/
 sweep_runs/
 test_checkpoints/
 wandb/

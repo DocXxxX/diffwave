@@ -92,6 +92,12 @@ def _sweep_config(max_steps, use_mamba=True, smoke=False):
           'blast_norm_mode': {
               'value': 'robust_log_scale',
           },
+          'blast_condition_mode': {
+              'value': base_params.blast_condition_mode,
+          },
+          'blast_split_mode': {
+              'value': base_params.blast_split_mode,
+          },
           'predict_amplitude_scale': {
               'value': True,
           },
@@ -108,6 +114,9 @@ def _sweep_config(max_steps, use_mamba=True, smoke=False):
               'values': [0.0, 0.01, 0.03],
           },
           'lambda_peak_rms': {
+              'values': [0.0, 0.01, 0.03],
+          },
+          'lambda_cumulative_energy': {
               'values': [0.0, 0.01, 0.03],
           },
           'gen_eval_interval': {

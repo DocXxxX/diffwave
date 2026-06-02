@@ -25,7 +25,13 @@ try:
 except ImportError:
   sf = None
 
-from diffwave.dataset import BLAST_CHANNEL_COLUMNS, BLAST_STATS_FILE, load_blast_stats
+from diffwave.dataset import (
+    BLAST_CHANNEL_COLUMNS,
+    BLAST_STATS_FILE,
+    build_blast_condition_vector,
+    condition_schema_from_stats,
+    load_blast_stats,
+)
 from diffwave.params import AttrDict, params as base_params
 from diffwave.model import DiffWave
 
@@ -67,6 +73,9 @@ def _checkpoint_params(checkpoint, overrides=None):
     model_params.audio_channels = int(state['input_projection.weight'].shape[1])
   if 'output_projection.weight' in state:
     model_params.audio_channels = int(state['output_projection.weight'].shape[0])
+  first_film_key = 'residual_layers.0.film.mapping.0.weight'
+  if first_film_key in state:
+    model_params.condition_dim = int(state[first_film_key].shape[1])
   if 'predict_amplitude_scale' not in checkpoint_params and not any(
       key.startswith('scale_predictor.') for key in state):
     model_params.predict_amplitude_scale = False
@@ -74,7 +83,25 @@ def _checkpoint_params(checkpoint, overrides=None):
   return model_params
 
 
-def _prepare_physical_params(physical_params, stats, device):
+def _as_batch_metadata(value, batch_size):
+  if isinstance(value, torch.Tensor):
+    value = value.detach().cpu().numpy().tolist()
+  if isinstance(value, np.ndarray):
+    value = value.tolist()
+  if isinstance(value, (list, tuple)):
+    if len(value) != batch_size:
+      raise ValueError(f'Expected metadata batch length {batch_size}, got {len(value)}.')
+    return list(value)
+  return [value] * batch_size
+
+
+def _warn_unknown_condition_category(name, value, allowed, fallback):
+  if value is None or value in allowed:
+    return
+  print(f'[WARN] Unknown {name}={value}; using default {fallback}.')
+
+
+def _prepare_physical_params(physical_params, stats, device, monitor_id=None, instrument=None):
   if physical_params is None:
     return None, 1
   if isinstance(physical_params, (list, tuple)):
@@ -84,10 +111,43 @@ def _prepare_physical_params(physical_params, stats, device):
   if physical_params.dim() == 1:
     physical_params = physical_params.unsqueeze(0)
   if stats is not None:
+    schema = condition_schema_from_stats(stats)
     mean = torch.tensor(stats['param_mean']).float()
     std = torch.tensor(stats['param_std']).float()
     if physical_params.shape[-1] != mean.shape[0]:
-      raise ValueError(f'Expected {mean.shape[0]} blast parameters, got {physical_params.shape[-1]}.')
+      monitor_ids = [int(value) for value in schema.get('monitor_ids', [])]
+      instruments = [str(value) for value in schema.get('instruments', [])]
+      monitor_values = _as_batch_metadata(monitor_id, physical_params.shape[0])
+      instrument_values = _as_batch_metadata(instrument, physical_params.shape[0])
+      raw_params = physical_params.detach().cpu().numpy()
+      expanded = []
+      for row, row_monitor_id, row_instrument in zip(raw_params, monitor_values, instrument_values):
+        if row_monitor_id is not None:
+          row_monitor_id = int(row_monitor_id)
+        if row_instrument is not None:
+          row_instrument = str(row_instrument)
+        _warn_unknown_condition_category(
+            'monitor_id',
+            row_monitor_id,
+            monitor_ids,
+            schema.get('default_monitor_id'))
+        _warn_unknown_condition_category(
+            'instrument',
+            row_instrument,
+            instruments,
+            schema.get('default_instrument'))
+        if row_monitor_id not in monitor_ids:
+          row_monitor_id = schema.get('default_monitor_id')
+        if row_instrument not in instruments:
+          row_instrument = schema.get('default_instrument')
+        expanded.append(build_blast_condition_vector(
+            row,
+            monitor_id=row_monitor_id,
+            instrument=row_instrument,
+            stats=stats))
+      physical_params = torch.from_numpy(np.stack(expanded)).float()
+    if physical_params.shape[-1] != mean.shape[0]:
+      raise ValueError(f'Expected {mean.shape[0]} blast conditions, got {physical_params.shape[-1]}.')
     physical_params = (physical_params - mean) / std
   return physical_params.to(device), physical_params.shape[0]
 
@@ -146,7 +206,9 @@ def generate_audio(model,
                    stats=None,
                    device=None,
                    fast_sampling=False,
-                   generator=None):
+                   generator=None,
+                   monitor_id=None,
+                   instrument=None):
   device = _default_device(device)
   model = model.to(device)
   if stats is not None:
@@ -156,7 +218,12 @@ def generate_audio(model,
     if 'audio_len' in stats and int(stats['audio_len']) != int(model.params.audio_len):
       raise ValueError(
           f"audio_len mismatch: stats={stats['audio_len']}, model={model.params.audio_len}.")
-  physical_params, batch_size = _prepare_physical_params(physical_params, stats, device)
+  physical_params, batch_size = _prepare_physical_params(
+      physical_params,
+      stats,
+      device,
+      monitor_id=monitor_id,
+      instrument=instrument)
 
   if spectrogram is not None:
     if len(spectrogram.shape) == 2:
@@ -206,7 +273,15 @@ def generate_audio(model,
   return _denormalize_audio(audio, stats, model=model, physical_params=physical_params), model.params.sample_rate
 
 
-def predict(spectrogram=None, physical_params=None, model_dir=None, params=None, device=None, fast_sampling=False, stats_path=None):
+def predict(spectrogram=None,
+            physical_params=None,
+            model_dir=None,
+            params=None,
+            device=None,
+            fast_sampling=False,
+            stats_path=None,
+            monitor_id=None,
+            instrument=None):
   device = _default_device(device)
   cache_key = (model_dir, str(device))
   stats = _load_stats(model_dir, stats_path)
@@ -222,7 +297,9 @@ def predict(spectrogram=None, physical_params=None, model_dir=None, params=None,
         physical_params=physical_params,
         stats=stats,
         device=device,
-        fast_sampling=fast_sampling)
+        fast_sampling=fast_sampling,
+        monitor_id=monitor_id,
+        instrument=instrument)
 
 
 def write_blast_csv(output_path, audio, sample_rate):
@@ -267,7 +344,9 @@ def main(args):
       fast_sampling=args.fast,
       params=None,
       device=args.device,
-      stats_path=args.stats_path)
+      stats_path=args.stats_path,
+      monitor_id=args.monitor_id,
+      instrument=args.instrument)
 
   if args.output.lower().endswith('.csv') or args.blast_params:
     write_blast_csv(args.output, audio, sr)
@@ -289,6 +368,10 @@ if __name__ == '__main__':
       help='legacy alias for --blast_params')
   parser.add_argument('--stats_path',
       help='path to blast_stats.json; defaults to the model directory')
+  parser.add_argument('--monitor_id', type=int,
+      help='monitor id for enhanced blast-condition checkpoints')
+  parser.add_argument('--instrument',
+      help='instrument label for enhanced blast-condition checkpoints')
   parser.add_argument('--output', '-o', default='output.csv',
       help='output file name')
   parser.add_argument('--device',

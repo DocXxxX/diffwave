@@ -5,7 +5,7 @@
 #   2. wandb agent <entity/project/sweep-id> --count <N>
 
 project: blast-diffwave
-name: Blast_Mamba_DiffWave_bayes
+name: Blast_Mamba_DiffWave_enhanced_v1_bayes
 
 program: run_blast_sweep.py
 command:
@@ -70,7 +70,7 @@ parameters:
   ################################################
 
   model_dir:
-    value: 'sweep_runs/blast_mamba'
+    value: 'sweep_runs/blast_mamba_enhanced_sweep'
 
   data_dirs:
     value: ['dataset/SZ_blast']
@@ -130,11 +130,17 @@ parameters:
   blast_norm_mode:
     value: 'robust_log_scale'
 
+  blast_condition_mode:
+    value: 'enhanced'
+
+  blast_split_mode:
+    value: 'event'
+
   predict_amplitude_scale:
     value: true
 
   lambda_scale:
-    values: [0.01, 0.05, 0.10]
+    values: [0.01, 0.03, 0.05, 0.10]
 
   blast_augment_level:
     values: ['off', 'conservative', 'medium']
@@ -150,16 +156,19 @@ parameters:
   ################################################
 
   lambda_mr_stft:
-    values: [0.0, 0.005, 0.01]
+    values: [0.005, 0.01, 0.02]
 
   lambda_band_energy:
-    values: [0.0, 0.01, 0.03]
+    values: [0.01, 0.02, 0.03, 0.05]
 
   lambda_envelope:
-    values: [0.0, 0.01, 0.03]
+    values: [0.01, 0.02, 0.03, 0.05]
 
   lambda_peak_rms:
-    values: [0.0, 0.01, 0.03]
+    values: [0.005, 0.01, 0.02, 0.03]
+
+  lambda_cumulative_energy:
+    values: [0.01, 0.02, 0.03, 0.05]
 
   aux_loss_warmup_steps:
     values: [1000, 2000, 4000]
@@ -184,7 +193,7 @@ parameters:
     value: 1
 
   full_gen_eval_samples_per_condition:
-    value: 3
+    value: 2
 
   gen_eval_seed:
     value: 20260425
@@ -197,7 +206,7 @@ parameters:
   ################################################
 
   generate_samples:
-    value: true
+    value: false
 
   sample_fast:
     value: false

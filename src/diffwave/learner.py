@@ -295,6 +295,13 @@ class DiffWaveLearner:
         torch.mean(torch.abs(torch.log((pred_peak + 1e-8) / (target_peak + 1e-8)))) +
         torch.mean(torch.abs(torch.log((pred_ptp + 1e-8) / (target_ptp + 1e-8)))))
 
+  def _cumulative_energy_loss(self, predicted, target):
+    pred_energy = torch.cumsum(torch.square(predicted), dim=-1)
+    target_energy = torch.cumsum(torch.square(target), dim=-1)
+    pred_energy = pred_energy / (pred_energy[..., -1:] + 1e-8)
+    target_energy = target_energy / (target_energy[..., -1:] + 1e-8)
+    return torch.mean(torch.abs(pred_energy - target_energy))
+
   def _aux_mask(self, t, noise_scale):
     timestep_max = float(getattr(self.params, 'aux_loss_timestep_max_ratio', 0.6)) * (len(self.params.noise_schedule) - 1)
     snr = noise_scale.flatten() / (1.0 - noise_scale.flatten() + 1e-8)
@@ -342,6 +349,7 @@ class DiffWaveLearner:
           ('loss/band_energy', 'lambda_band_energy', self._band_energy_loss),
           ('loss/envelope', 'lambda_envelope', self._envelope_loss),
           ('loss/peak_rms', 'lambda_peak_rms', self._peak_rms_loss),
+          ('loss/cumulative_energy', 'lambda_cumulative_energy', self._cumulative_energy_loss),
       ]
       for loss_name, weight_name, fn in aux_specs:
         weight = float(getattr(self.params, weight_name, 0.0) or 0.0) * warmup

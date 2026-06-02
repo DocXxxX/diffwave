@@ -56,6 +56,8 @@ def _apply_overrides(args):
       'audio_channels',
       'audio_clip',
       'blast_norm_mode',
+      'blast_condition_mode',
+      'blast_split_mode',
       'predict_amplitude_scale',
       'lambda_scale',
       'condition_dim',
@@ -89,6 +91,7 @@ def _apply_overrides(args):
       'lambda_band_energy',
       'lambda_envelope',
       'lambda_peak_rms',
+      'lambda_cumulative_energy',
       'aux_loss_warmup_steps',
       'aux_loss_timestep_max_ratio',
       'aux_loss_min_snr',
@@ -153,6 +156,8 @@ if __name__ == '__main__':
   parser.add_argument('--audio_channels', type=int)
   parser.add_argument('--audio_clip', type=float)
   parser.add_argument('--blast_norm_mode', choices=['global_zscore_clip', 'robust_log_scale'])
+  parser.add_argument('--blast_condition_mode', choices=['legacy', 'enhanced'])
+  parser.add_argument('--blast_split_mode', choices=['record', 'event'])
   parser.add_argument('--predict_amplitude_scale', type=_str_to_bool)
   parser.add_argument('--lambda_scale', type=float)
   parser.add_argument('--condition_dim', type=int)
@@ -176,6 +181,7 @@ if __name__ == '__main__':
   parser.add_argument('--lambda_band_energy', type=float)
   parser.add_argument('--lambda_envelope', type=float)
   parser.add_argument('--lambda_peak_rms', type=float)
+  parser.add_argument('--lambda_cumulative_energy', type=float)
   parser.add_argument('--aux_loss_warmup_steps', type=int)
   parser.add_argument('--aux_loss_timestep_max_ratio', type=float)
   parser.add_argument('--aux_loss_min_snr', type=float)
